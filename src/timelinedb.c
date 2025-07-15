@@ -59,7 +59,7 @@ void free_RawTimelineValuesBuf(RawTimelineValuesBuf *buf) {
     buf->nr_of_samples = 0;
 }
 
-u_int8_t getBackendsCount() {
+uint8_t getBackendsCount() {
     return 2; // Currently only one backend
 }
 int getBackendName(uint8_t index, const char **name) {

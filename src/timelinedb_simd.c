@@ -13,7 +13,11 @@
 #include <stddef.h>
 #include "timelinedb_simd.h"
 
-
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(NEON_ENABLED)
+    #include <arm_neon.h>
+#elif (defined(__AVX2__) || defined(__AVX__)) && defined(AVX_ENABLED)
+    #include <immintrin.h>
+#endif
 
 /*
 Note: Some quick performance test was made with this preliminary sources on Apple M2 Pro.
@@ -65,6 +69,37 @@ static int convert_sample_rate_SIMD_s16x8_c(const RawTimelineValuesBuf *input, R
     }
     return 0;
 }
+int init_InterpInfo(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *output) {
+    int16_t *src = (int16_t*)input->valueBuffer;
+    int16_t *dst = (int16_t*)output->valueBuffer;
+    uint32_t ch = input->nr_of_channels;
+    if (ch != 8) return -1;
+    uint32_t new_nr_samples=output->nr_of_samples;
+
+    SampleInterpInfo *interp_array = (SampleInterpInfo*)malloc(new_nr_samples * sizeof(SampleInterpInfo));
+    output->prepared_data_src = interp_array;
+
+    for (uint32_t i = 0; i < new_nr_samples; ++i) {
+        double original_index = (double)i / ((double)new_nr_samples / (double)input->nr_of_samples);
+        uint32_t idx0 = (uint32_t)original_index;
+        if (idx0 >= input->nr_of_samples - 1) idx0 = input->nr_of_samples - 2;
+        uint32_t idx1 = (idx0 + 1 < input->nr_of_samples) ? idx0 + 1 : idx0;
+        double frac = original_index - idx0;
+        uint16_t frac_fixed = (uint16_t)(frac * 65536.0);
+        uint16_t inv_frac_fixed = 0x10000 - frac_fixed;
+        interp_array[i].idx0 = idx0;
+        interp_array[i].idx1 = idx1;
+        interp_array[i].frac = frac_fixed;
+        interp_array[i].inv_frac = inv_frac_fixed;
+    }
+    return 0;
+}
+void free_InterpInfo(RawTimelineValuesBuf *output) {
+    if (output->prepared_data_src) {
+        free(output->prepared_data_src);
+        output->prepared_data_src = NULL;
+    }
+}
 
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(NEON_ENABLED)
 /*
@@ -110,37 +145,6 @@ static int convert_sample_rate_SIMD_s16x8_neon(const RawTimelineValuesBuf *input
     return 0;
 }
 */
-int init_InterpInfo(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *output) {
-    int16_t *src = (int16_t*)input->valueBuffer;
-    int16_t *dst = (int16_t*)output->valueBuffer;
-    uint32_t ch = input->nr_of_channels;
-    if (ch != 8) return -1;
-    uint32_t new_nr_samples=output->nr_of_samples;
-
-    SampleInterpInfo *interp_array = (SampleInterpInfo*)malloc(new_nr_samples * sizeof(SampleInterpInfo));
-    output->prepared_data_src = interp_array;
-
-    for (uint32_t i = 0; i < new_nr_samples; ++i) {
-        double original_index = (double)i / ((double)new_nr_samples / (double)input->nr_of_samples);
-        uint32_t idx0 = (uint32_t)original_index;
-        if (idx0 >= input->nr_of_samples - 1) idx0 = input->nr_of_samples - 2;
-        uint32_t idx1 = (idx0 + 1 < input->nr_of_samples) ? idx0 + 1 : idx0;
-        double frac = original_index - idx0;
-        uint16_t frac_fixed = (uint16_t)(frac * 65536.0);
-        uint16_t inv_frac_fixed = 0x10000 - frac_fixed;
-        interp_array[i].idx0 = idx0;
-        interp_array[i].idx1 = idx1;
-        interp_array[i].frac = frac_fixed;
-        interp_array[i].inv_frac = inv_frac_fixed;
-    }
-    return 0;
-}
-void free_InterpInfo(RawTimelineValuesBuf *output) {
-    if (output->prepared_data_src) {
-        free(output->prepared_data_src);
-        output->prepared_data_src = NULL;
-    }
-}
 
 static int convert_sample_rate_SIMD_s16x8_neon(
     const RawTimelineValuesBuf *input, RawTimelineValuesBuf *output)
@@ -279,6 +283,38 @@ int aggregate_minmax_SIMD_s16x8_neon(const RawTimelineValuesBuf *input, RawTimel
     }
     return 0;
 }
+#elif (defined(__AVX2__) || defined(__AVX__)) && defined(AVX_ENABLED)
+int aggregate_minmax_SIMD_s16x8_avx(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t i, uint32_t start, uint32_t end) {
+      for (uint8_t ch = 0; ch < input->nr_of_channels; ++ch) {
+        // Inicializáljuk a minimumot és maximumot 16 bites egész típusokra, 256 bites AVX regiszterben (8 x int32 miatt)
+        __m128i min_s16 = _mm_set1_epi16(INT16_MAX);
+        __m128i max_s16 = _mm_set1_epi16(INT16_MIN);
+
+        for (uint32_t j = start; j < end; ++j) {
+            int16_t sample = ((int16_t*)input->valueBuffer)[j * input->nr_of_channels + ch];
+            __m128i current = _mm_set1_epi16(sample);
+
+            min_s16 = _mm_min_epi16(min_s16, current);
+            max_s16 = _mm_max_epi16(max_s16, current);
+        }
+
+        // Kiválasztjuk az egyetlen minimumot és maximumot az AVX regiszterekből
+        int16_t min_vals[8], max_vals[8];
+        _mm_storeu_si128((__m128i*)min_vals, min_s16);
+        _mm_storeu_si128((__m128i*)max_vals, max_s16);
+
+        int16_t min_final = INT16_MAX;
+        int16_t max_final = INT16_MIN;
+        for (int k = 0; k < 8; ++k) {
+            if (min_vals[k] < min_final) min_final = min_vals[k];
+            if (max_vals[k] > max_final) max_final = max_vals[k];
+        }
+
+        ((int16_t*)outMin->valueBuffer)[i * input->nr_of_channels + ch] = min_final;
+        ((int16_t*)outMax->valueBuffer)[i * input->nr_of_channels + ch] = max_final;
+    }
+    return 0;
+}
 #endif
 
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(NEON_ENABLED)
@@ -403,6 +439,65 @@ int convert_sample_rate_SIMD_s16x8_bresenham_neon(const RawTimelineValuesBuf* in
 }
 #endif
 
+#if (defined(__AVX2__) || defined(__AVX__)) && defined(AVX_ENABLED)
+int convert_sample_rate_SIMD_s16x8_bresenham_avx(const RawTimelineValuesBuf* input, RawTimelineValuesBuf* output)
+{
+    int16_t *src = (int16_t*)input->valueBuffer;
+    int16_t *dst = (int16_t*)output->valueBuffer;
+    uint32_t ch = input->nr_of_channels;
+    if (ch != 8) return -1;
+
+    uint32_t in_samples = input->nr_of_samples;
+    uint32_t out_samples = output->nr_of_samples;
+
+    uint32_t accum = 0;
+    uint32_t step = in_samples;
+    uint32_t scale = out_samples;
+    uint32_t idx0 = 0;
+
+    for (uint32_t i = 0; i < out_samples; ++i) {
+        uint32_t idx1 = (idx0 + 1 < in_samples) ? idx0 + 1 : idx0;
+
+        uint32_t frac_fixed = ((uint64_t)accum << 16) / scale;
+        uint32_t inv_frac_fixed = 0x10000 - frac_fixed;
+
+        // Load 8 int16 samples from idx0 and idx1
+        __m128i v0_s16 = _mm_loadu_si128((__m128i*)&src[idx0 * ch]);
+        __m128i v1_s16 = _mm_loadu_si128((__m128i*)&src[idx1 * ch]);
+
+        // Extend to int32: low + high
+        __m256i v0_s32 = _mm256_cvtepi16_epi32(v0_s16);
+        __m256i v1_s32 = _mm256_cvtepi16_epi32(v1_s16);
+
+        // Multiply each with fixed-point factors
+        __m256i v0_scaled = _mm256_mullo_epi32(v0_s32, _mm256_set1_epi32(inv_frac_fixed));
+        __m256i v1_scaled = _mm256_mullo_epi32(v1_s32, _mm256_set1_epi32(frac_fixed));
+
+        __m256i interp = _mm256_add_epi32(v0_scaled, v1_scaled);
+        __m256i rounded = _mm256_add_epi32(interp, _mm256_set1_epi32(1 << 15));
+        __m256i shifted = _mm256_srli_epi32(rounded, 16);
+
+        // Narrow back to int16
+        __m128i result = _mm256_castsi256_si128(_mm256_packs_epi32(shifted, _mm256_setzero_si256()));
+
+        // Store
+        _mm_storeu_si128((__m128i*)&dst[i * ch], result);
+
+        // Bresenham increment
+        accum += step;
+        if (accum >= scale) {
+            idx0++;
+            accum -= scale;
+        }
+        if (idx0 >= in_samples - 1) {
+            idx0 = in_samples - 2;
+            accum = 0;
+        }
+    }
+    return 0;
+}
+#endif
+
 // C version as fallback and dispatcher
 static int convert_sample_rate_SIMD_s16x8_bresenham(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *output)
 {
@@ -458,8 +553,8 @@ const TimelineBackendFunctions gTimelineBackendFunctionsSIMD = {
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_neon,
 #elif defined(__AVX2__) || defined(__AVX__)
     .name = "Intel AVX2 SIMD Backend",
-    .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_avx, // AVX2 fallback
-    .aggregate_minmax_s8 = aggregate_minmax_s8_avx, // AVX2 fallback
+    .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_bresenham_avx,//convert_sample_rate_SIMD_s16x8_avx, // AVX2 fallback
+    .aggregate_minmax_s8 = aggregate_minmax_s8_c, // AVX2 fallback
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_avx, // AVX2 fallback
 #else   //fallback to C version implemented version of SIMD technology is not available or disabled
     .name = "Fallback C Backend",

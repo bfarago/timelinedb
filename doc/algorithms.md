@@ -66,3 +66,12 @@ The algorithm is extremely efficient, as it:
 - Supports real-time interaction (scrolling, zooming) with minimal latency.
 
 Unlike true downsampling for signal processing, this method is designed purely for **graphical representation**, and does not alter the underlying data fidelity or sample rate.
+
+### Sin curve generation
+
+## Slow Algorithm
+This one uses sin float functions a lot. Therefore it takes aprox 200ms runtime (on intel).
+
+## Faster Sin generation
+This function uses the Rodrivues formula to calculate ratation.
+👉 See [Wiki: Rodrigues formula](https://en.wikipedia.org/wiki/Rodrigues%27_formula) for detailed descriptions of the polinomial rotation algorithm used in TimelineDB.

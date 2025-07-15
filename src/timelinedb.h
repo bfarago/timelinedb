@@ -59,7 +59,7 @@ typedef struct {
     SampleInterpInfo *prepared_data_src;
 } RawTimelineValuesBuf;
 
-u_int8_t getBackendsCount();
+uint8_t getBackendsCount();
 int getBackendName(uint8_t index, const char **name);
 int setBackend(uint8_t index);
 

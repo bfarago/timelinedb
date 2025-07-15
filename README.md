@@ -50,6 +50,11 @@ Dependencies (via Homebrew on macOS):
 brew install sdl2 sdl2_ttf
 ```
 
+On Ubuntu:
+```bash
+sudo apt install libsdl2-dev libsdl2-ttf-dev
+```
+
 Build:
 
 ```bash

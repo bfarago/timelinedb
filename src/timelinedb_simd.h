@@ -11,8 +11,9 @@
 #include "timelinedb.h"
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    #include <arm_neon.h>
     #define NEON_ENABLED
+#elif defined(__AVX2__) || defined(__AVX__)
+    #define AVX_ENABLED
 #endif
 
 typedef int (*fn_convert)(const RawTimelineValuesBuf *, RawTimelineValuesBuf *);

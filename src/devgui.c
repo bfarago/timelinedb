@@ -16,15 +16,30 @@
 #define MAX_TIMELINE_CHANNELS 32
 #define MAX_TIMELINE_BUFS 4
 #define MAX_TIMELINE_SAMPLES 1000000
+#define DELAY_SCREEN_REFRESH (1000 / 30 )
+
+#define LUT_SIZE 1024
+#define LUT_MASK (LUT_SIZE - 1)
 
 int g_screen_w = 800;
 int g_screen_h = 600;
 int g_screen_size_changed = 1;
 
 typedef struct {
+//    float s, c;         // aktuális sin és cos
+    float amplitude;
+    float w;
+    float wdt;
+    float sin_wdt;
+    float cos_wdt;
+    RawTimelineValuesBuf* buf;
+} SignalGenState;
+
+typedef struct {
     float amplitude;
     float frequency;
     float phase;
+    SignalGenState st;
 } SignalParams;
 
 typedef struct {
@@ -59,7 +74,8 @@ SignalCurvesView g_signal_curves_view = {
     .right_margin = 50 // Right margin for scrollbar or other UI elements
 };
 static SignalParams g_signal_params[MAX_TIMELINE_CHANNELS];
-
+const float g_sample_rate = 1000000.0f;
+float g_dt = 1.0f / 1000000.0f;;
 
 
 RawTimelineValuesBuf g_timeline_bufs[MAX_TIMELINE_BUFS];
@@ -68,14 +84,30 @@ RawTimelineValuesBuf g_timeline_max[MAX_TIMELINE_BUFS];
 TimelineDB g_timeline_db;
 TimelineEvent g_timeline_events[MAX_TIMELINE_CHANNELS];
 
+float sin_lut[LUT_SIZE];
+float cos_lut[LUT_SIZE];
 
 void db_init() {
-    for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
-        g_signal_params[i].amplitude = 10000.0f + (rand() % 20000); // 10000 - 29999
-        g_signal_params[i].frequency = 0.1f + ((float)(rand() % 1000) / 10.0f); // 0.1 - 10.0 Hz
-        g_signal_params[i].phase = ((float)(rand() % 6283)) / 1000.0f; // 0 - ~2π
+    for (int i = 0; i < LUT_SIZE; i++) {
+        sin_lut[i] = sinf(2.0f * M_PI * (float)i / LUT_SIZE);
+        cos_lut[i] = cosf(2.0f * M_PI * (float)i / LUT_SIZE);
     }
-
+    for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
+        SignalParams* p = &g_signal_params[i];
+        p->amplitude = 10000.0f + (rand() % 20000); // 10000 - 29999
+        p->frequency = 0.1f + ((float)(rand() % 10000) / 10.0f); // 0.1 - 10.0 Hz
+        p->phase = ((float)(rand() % 6283)) / 1000.0f; // 0 - ~2π
+        
+        SignalGenState *sgs = &p->st;
+        sgs->buf = &g_timeline_bufs[ i >> 3 ];
+        float f = p->frequency;
+        float w = 2.0f * M_PI * f;
+        sgs->w = w;
+        float wdt = w * g_dt;
+        sgs->wdt = wdt;
+        sgs->sin_wdt = sinf(wdt);
+        sgs->cos_wdt = cosf(wdt); 
+    }
     g_signal_curves_view.start_y = 100;
     g_signal_curves_view.label_width = 100; // Width for channel labels
     g_signal_curves_view.right_margin = 50; // Right margin for scrollbar or other UI elements
@@ -135,7 +167,109 @@ void db_free() {
     }
 }
 
-void db_update(Uint32 timestamp) {
+/*
+TODO : 
+1) 32x4 sinf cosf can be converted to LUT 
+2) Move to lib simmd.c
+
+Pure C version runtime was: 220ms,
+Rodrigues and avx implementation: 14ms
+@1M sample x 32 channel  
+*/
+void db_update(Uint32 timestamp){
+    const float t0 = (float)timestamp / 1000.0f;
+    for (int b = 0; b < 4; b++) {
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
+        int16_t* data = (int16_t*)buf->valueBuffer;
+        uint32_t samples = buf->nr_of_samples;
+//        const uint32_t channels = 8; // fixen 8 csatorna / buffer
+
+        // 1. előkészítjük a 8 csatornához az amplitúdót, sin/cos induló értéket stb.
+        float amp_f[8], s_f[8], c_f[8], sin_wdt_f[8], cos_wdt_f[8];
+        for (int ch = 0; ch < 8; ++ch) {
+            int global_ch = b * 8 + ch;
+            SignalParams* p = &g_signal_params[global_ch];
+
+            amp_f[ch] = p->amplitude;
+            float w = 2.0f * M_PI * p->frequency;
+            float angle = w * t0 + p->phase;
+            s_f[ch] = sinf(angle);
+            c_f[ch] = cosf(angle);
+            float wdt = w * g_dt;
+            sin_wdt_f[ch] = sinf(wdt);
+            cos_wdt_f[ch] = cosf(wdt);
+        }
+
+        // 2. betöltjük SIMD regiszterekbe
+        __m256 amp      = _mm256_loadu_ps(amp_f);
+        __m256 s        = _mm256_loadu_ps(s_f);
+        __m256 c        = _mm256_loadu_ps(c_f);
+        __m256 sin_wdt  = _mm256_loadu_ps(sin_wdt_f);
+        __m256 cos_wdt  = _mm256_loadu_ps(cos_wdt_f);
+
+        // 3. végigmegyünk a mintákon
+        for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
+            __m256 val = _mm256_mul_ps(amp, s);
+            __m256i i32 = _mm256_cvtps_epi32(val);
+            __m128i lo = _mm256_extractf128_si256(i32, 0);
+            __m128i hi = _mm256_extractf128_si256(i32, 1);
+            __m128i i16 = _mm_packs_epi32(lo, hi);
+            _mm_storeu_si128((__m128i*)&data[s_idx * 8], i16);
+
+            // Rodrigues-frissítés
+            __m256 s_new = _mm256_add_ps(
+                _mm256_mul_ps(s, cos_wdt),
+                _mm256_mul_ps(c, sin_wdt)
+            );
+            __m256 c_new = _mm256_sub_ps(
+                _mm256_mul_ps(c, cos_wdt),
+                _mm256_mul_ps(s, sin_wdt)
+            );
+            s = s_new;
+            c = c_new;
+        }
+    }
+}
+
+#if 0
+void db_update3(Uint32 timestamp) {
+    const float t0 = (float)timestamp / 1000.0f;
+    for(uint8_t gch = 0; gch < MAX_TIMELINE_CHANNELS; gch++){
+        SignalParams* p = &g_signal_params[gch];
+        SignalGenState *sgs = &p->st;
+        RawTimelineValuesBuf* buf = sgs->buf;
+        int16_t* data = (int16_t*)buf->valueBuffer;
+
+        float phase = p->phase;
+        float amp = p->amplitude;
+        float w = sgs->w;
+        uint32_t samples = buf->nr_of_samples;
+        uint32_t channels = 8;
+        uint8_t ch = gch & 7;
+        float sin_wdt = sgs->sin_wdt;
+        float cos_wdt = sgs->cos_wdt;
+        
+        float angle = w * t0 + phase;
+        float phase_frac = angle / (2.0f * M_PI); 
+        phase_frac -= (int)phase_frac;
+        if (phase_frac < 0) phase_frac += 1.0f;
+        uint32_t idx = (uint32_t)(phase_frac * LUT_SIZE) & LUT_MASK;
+        float s = sin_lut[idx];
+        float c = cos_lut[idx];
+        
+        for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
+            int16_t sample = (int16_t)(amp * s);
+            data[s_idx * channels + ch] = sample;
+            float s_new = s * cos_wdt + c * sin_wdt;
+            float c_new = c * cos_wdt - s * sin_wdt;
+            s = s_new;
+            c = c_new;
+        }
+    }
+}   
+
+
+void db_update1(Uint32 timestamp) {
     const float sample_rate = 1000000.0f;
     const float t0 = (float)timestamp / 1000.0f;
 
@@ -157,14 +291,61 @@ void db_update(Uint32 timestamp) {
         }
     }
 }
+void db_update2(Uint32 timestamp) {
+    const float sample_rate = 1000000.0f;
+    const float t0 = (float)timestamp / 1000.0f;
+    // Δt = 1/sample_rate
+    float dt = 1.0f / sample_rate;
+    for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
+        int16_t* data = (int16_t*)buf->valueBuffer;
+        uint32_t samples = buf->nr_of_samples;
+        uint32_t channels = buf->nr_of_channels;
+
+        for (uint32_t ch = 0; ch < channels; ch++) {
+            int global_ch = b * 8 + ch;
+            SignalParams* p = &g_signal_params[global_ch];
+
+            float f = p->frequency;
+            float w = 2.0f * M_PI * f;
+            float phase = p->phase;
+            float amp = p->amplitude;
+            float wdt = w * dt;
+
+            // rekurzív sin hullámgenerátor (Rodrigues-formula)
+            float sin_wdt = sinf(wdt);
+            float cos_wdt = cosf(wdt);
+            float s = sinf(w * t0 + phase);
+            float c = cosf(w * t0 + phase);
+
+            for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
+                int16_t sample = (int16_t)(amp * s);
+                data[s_idx * channels + ch] = sample;
+
+                // rekurzív következő sin/cos érték
+                float s_new = s * cos_wdt + c * sin_wdt;
+                float c_new = c * cos_wdt - s * sin_wdt;
+                s = s_new;
+                c = c_new;
+            }
+        }
+    }
+} 
+#endif
+
 void SDL_DrawText(SDL_Renderer* renderer, const char* text, int x, int y) {
     static TTF_Font* font = NULL;
     if (!font) {
+        #ifdef APPLE
         font = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 12);
+        #else
+        font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",12);
+        #endif
         if (!font) {
             SDL_Log("TTF_OpenFont failed: %s", TTF_GetError());
             return;
         }
+        
     }
 
     SDL_Color white = {255, 255, 255, 255};
@@ -214,10 +395,18 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
     SDL_DrawText(renderer, curve->event->name, 0, curve->offsety);
 
     int drawable_width = g_screen_w - g_signal_curves_view.label_width - g_signal_curves_view.right_margin;
+    uint16_t *minp= (uint16_t *)min_buf->valueBuffer;
+    uint16_t *maxp= (uint16_t *)max_buf->valueBuffer;
+    minp+=curve->channelidx;
+    maxp+=curve->channelidx;
+    uint8_t d = min_buf->nr_of_channels;
     for (uint32_t i = 0; i < nr_of_samples - 1; i++) {
         int16_t v1, v2;
-        getSampleValue_SIMD_sint16x8(max_buf, i, curve->channelidx, &v1);
-        getSampleValue_SIMD_sint16x8(min_buf, i, curve->channelidx, &v2);
+        //getSampleValue_SIMD_sint16x8(max_buf, i, curve->channelidx, &v1);
+        //getSampleValue_SIMD_sint16x8(min_buf, i, curve->channelidx, &v2);
+        v1 = *minp;
+        v2 = *minp;
+        minp+= d; maxp+= d;
         SDL_RenderDrawLine(renderer,
             start_x + i * drawable_width / nr_of_samples,
             curve->offsety - (int)(v1 * curve->scale),
@@ -273,12 +462,15 @@ int main() {
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
     SDL_Window* window = SDL_CreateWindow("Draw curve",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, SDL_WINDOW_RESIZABLE);
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, g_screen_w, g_screen_h, SDL_WINDOW_RESIZABLE);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
 
     SDL_GetWindowSize(window, &g_screen_w, &g_screen_h);
     Uint32 now = SDL_GetTicks();
     setBackend(1); // Use SIMD backend
+    const char * bename= NULL;
+    getBackendName(-1, &bename);
+    printf("%s\n", bename);
     db_init();
     db_update(now);
     screen_update(now, renderer);
@@ -289,7 +481,7 @@ int main() {
 
     while (running) {
 
-        SDL_Delay(10);
+        // SDL_Delay(DELAY_SCREEN_REFRESH);
         now = SDL_GetTicks();
 
         while (SDL_PollEvent(&event)) {
@@ -306,11 +498,16 @@ int main() {
                 }
             }
         }
-
-        if (now - last_timer >= 20) {
+        int32_t elapsed = now - last_timer;
+        // if (elapsed < 0) elapsed =0;
+        if ( elapsed >= DELAY_SCREEN_REFRESH) {
             on_timer_tick(now, renderer);
             last_timer = now;
+        }else{
+            int32_t next=DELAY_SCREEN_REFRESH - elapsed;
+            if (next>0) SDL_Delay(next);
         }
+
     }
 
     SDL_DestroyRenderer(renderer);
