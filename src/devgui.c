@@ -25,6 +25,9 @@ int g_screen_w = 800;
 int g_screen_h = 600;
 int g_screen_size_changed = 1;
 
+TTF_Font *g_font_label = NULL;
+TTF_Font *g_font_axis = NULL;
+
 typedef struct {
 //    float s, c;         // aktuális sin és cos
     float amplitude;
@@ -176,6 +179,67 @@ Pure C version runtime was: 220ms,
 Rodrigues and avx implementation: 14ms
 @1M sample x 32 channel  
 */
+// Apple NEON SIMD implementation using Rodrigues formula
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+#include <arm_neon.h>
+void db_update(Uint32 timestamp){
+    const float t0 = (float)timestamp / 1000.0f;
+    for (int b = 0; b < 4; b++) {
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
+        int16_t* data = (int16_t*)buf->valueBuffer;
+        uint32_t samples = buf->nr_of_samples;
+
+        float amp_f[8], s_f[8], c_f[8], sin_wdt_f[8], cos_wdt_f[8];
+        for (int ch = 0; ch < 8; ++ch) {
+            int global_ch = b * 8 + ch;
+            SignalParams* p = &g_signal_params[global_ch];
+
+            amp_f[ch] = p->amplitude;
+            float w = 2.0f * M_PI * p->frequency;
+            float angle = w * t0 + p->phase;
+            s_f[ch] = sinf(angle);
+            c_f[ch] = cosf(angle);
+            float wdt = w * g_dt;
+            sin_wdt_f[ch] = sinf(wdt);
+            cos_wdt_f[ch] = cosf(wdt);
+        }
+
+        float32x4_t amp0 = vld1q_f32(&amp_f[0]);
+        float32x4_t amp1 = vld1q_f32(&amp_f[4]);
+        float32x4_t s0 = vld1q_f32(&s_f[0]);
+        float32x4_t s1 = vld1q_f32(&s_f[4]);
+        float32x4_t c0 = vld1q_f32(&c_f[0]);
+        float32x4_t c1 = vld1q_f32(&c_f[4]);
+        float32x4_t sinwdt0 = vld1q_f32(&sin_wdt_f[0]);
+        float32x4_t sinwdt1 = vld1q_f32(&sin_wdt_f[4]);
+        float32x4_t coswdt0 = vld1q_f32(&cos_wdt_f[0]);
+        float32x4_t coswdt1 = vld1q_f32(&cos_wdt_f[4]);
+
+        for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
+            float32x4_t v0 = vmulq_f32(amp0, s0);
+            float32x4_t v1 = vmulq_f32(amp1, s1);
+
+            int32x4_t i32_0 = vcvtq_s32_f32(v0);
+            int32x4_t i32_1 = vcvtq_s32_f32(v1);
+
+            int16x4_t i16_0 = vqmovn_s32(i32_0);
+            int16x4_t i16_1 = vqmovn_s32(i32_1);
+            int16x8_t packed = vcombine_s16(i16_0, i16_1);
+            vst1q_s16(&data[s_idx * 8], packed);
+
+            float32x4_t s0_new = vmlaq_f32(vmulq_f32(s0, coswdt0), c0, sinwdt0);
+            float32x4_t s1_new = vmlaq_f32(vmulq_f32(s1, coswdt1), c1, sinwdt1);
+            float32x4_t c0_new = vmlsq_f32(vmulq_f32(c0, coswdt0), s0, sinwdt0);
+            float32x4_t c1_new = vmlsq_f32(vmulq_f32(c1, coswdt1), s1, sinwdt1);
+
+            s0 = s0_new;
+            s1 = s1_new;
+            c0 = c0_new;
+            c1 = c1_new;
+        }
+    }
+}
+#else
 void db_update(Uint32 timestamp){
     const float t0 = (float)timestamp / 1000.0f;
     for (int b = 0; b < 4; b++) {
@@ -230,6 +294,7 @@ void db_update(Uint32 timestamp){
         }
     }
 }
+#endif
 
 #if 0
 void db_update3(Uint32 timestamp) {
@@ -332,24 +397,23 @@ void db_update2(Uint32 timestamp) {
     }
 } 
 #endif
+void init_fonts() {
+    #ifdef APPLE
+    g_font_label = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 12);
+    g_font_axis  = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 9);
+    #else
+    g_font_label = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",12);
+    g_font_axis  = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",9);
+    #endif
+    if (!g_font_label) {
+        SDL_Log("TTF_OpenFont failed: %s", TTF_GetError());
+        return;
+    }
+}
 
 void SDL_DrawText(SDL_Renderer* renderer, const char* text, int x, int y) {
-    static TTF_Font* font = NULL;
-    if (!font) {
-        #ifdef APPLE
-        font = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 12);
-        #else
-        font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",12);
-        #endif
-        if (!font) {
-            SDL_Log("TTF_OpenFont failed: %s", TTF_GetError());
-            return;
-        }
-        
-    }
-
     SDL_Color white = {255, 255, 255, 255};
-    SDL_Surface* surface = TTF_RenderText_Solid(font, text, white);
+    SDL_Surface* surface = TTF_RenderText_Solid(g_font_label, text, white);
     if (!surface) {
         SDL_Log("TTF_RenderText_Solid failed: %s", TTF_GetError());
         return;
@@ -405,13 +469,73 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
         //getSampleValue_SIMD_sint16x8(max_buf, i, curve->channelidx, &v1);
         //getSampleValue_SIMD_sint16x8(min_buf, i, curve->channelidx, &v2);
         v1 = *minp;
-        v2 = *minp;
+        v2 = *maxp;
         minp+= d; maxp+= d;
         SDL_RenderDrawLine(renderer,
             start_x + i * drawable_width / nr_of_samples,
             curve->offsety - (int)(v1 * curve->scale),
             start_x + (i + 1) * drawable_width / nr_of_samples,
             curve->offsety - (int)(v2 * curve->scale));
+    }
+}
+void draw_time_label(SDL_Renderer *renderer, int x, int t_ms) {
+    char label[16];
+    snprintf(label, sizeof(label), "%d ms", t_ms);
+
+    SDL_Color textColor = {255, 255, 255, 255};
+    SDL_Surface *textSurface = TTF_RenderText_Blended(g_font_axis, label, textColor);
+    if (!textSurface) return;
+
+    SDL_Texture *textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
+    if (!textTexture) {
+        SDL_FreeSurface(textSurface);
+        return;
+    }
+
+    int text_w = textSurface->w;
+    int text_h = textSurface->h;
+    SDL_Rect dstRect = { x - text_w / 2, 50, text_w, text_h };
+
+    SDL_RenderCopy(renderer, textTexture, NULL, &dstRect);
+    SDL_DestroyTexture(textTexture);
+    SDL_FreeSurface(textSurface);
+}
+void draw_time_axis(SDL_Renderer *renderer, Uint32 timestamp) {
+(void)timestamp; // Unused in this example
+    const int top = 50; // Top position for the time axis
+    const int axis_height = g_signal_curves_view.start_y - top;
+    const int time_range_ms = 1000;
+    const int tick_interval_ms = 10;       // fine
+    const int middle_interval_ms = 50;       // middle
+    const int major_tick_interval_ms = 100; // coarse
+    const int label_width = g_signal_curves_view.label_width;
+    const int right_margin = g_signal_curves_view.right_margin;
+    const int plot_area_w = g_screen_w - label_width - right_margin;
+    const float pixels_per_ms = (float)plot_area_w / time_range_ms;
+    const int axisline_height = g_screen_h - top - 50; // 50px for bottom margin
+
+    // Reset timestamp to 0 for axis drawing due to the first pixel column is always 0 (or user choose it by scrolling)
+    timestamp = 0;
+    // Vonalak és szöveg színe
+    SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255); // halványabb szürke
+    SDL_Rect axis_rect = {0, top, g_screen_w, axis_height};
+    SDL_RenderFillRect(renderer, &axis_rect);
+
+    for (int t = 0; t <= time_range_ms; t += tick_interval_ms) {
+        int x = label_width + (int)(t * pixels_per_ms);
+        if (x >= g_screen_w - right_margin) break;
+
+        if (t % major_tick_interval_ms == 0) {
+            SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
+            draw_time_label(renderer, x, t);
+        } else if (t % middle_interval_ms == 0) {
+            SDL_SetRenderDrawColor(renderer, 64, 64, 64, 255);
+        } else if (t % tick_interval_ms == 0) {
+            SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
+        } else {
+            continue; // Skip drawing for non-tick intervals
+        }
+        SDL_RenderDrawLine(renderer, x, top, x, axisline_height);
     }
 }
 void draw_curves(SDL_Renderer* renderer) {
@@ -450,6 +574,7 @@ void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // Set background color to black
     SDL_RenderClear(renderer);
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Set color for min/max lines
+    draw_time_axis(renderer, timestamp);
     draw_curves(renderer);
     SDL_RenderPresent(renderer);
 }
@@ -461,9 +586,10 @@ void on_timer_tick(Uint32 timestamp, SDL_Renderer* renderer) {
 int main() {
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
+    init_fonts();
     SDL_Window* window = SDL_CreateWindow("Draw curve",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, g_screen_w, g_screen_h, SDL_WINDOW_RESIZABLE);
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED| SDL_RENDERER_PRESENTVSYNC);
 
     SDL_GetWindowSize(window, &g_screen_w, &g_screen_h);
     Uint32 now = SDL_GetTicks();
