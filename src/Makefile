@@ -27,15 +27,15 @@ else ifeq ($(shell uname -m),aarch64)
 	CFLAGSSIMD = -DARM -O3 -ftree-vectorize -march=armv8-a+simd -mcpu=cortex-a72 -fno-signed-zeros -ffast-math
 else ifeq ($(shell uname -p),x86_64)
 	CC = gcc
-	CFLAGS = -Wall -Wextra -std=gnu11 -O3 -g -mavx2 -pg
+	CFLAGS = -Wall -Wextra -std=gnu11 -O3 -g -mavx2
 	CFLAGSSIMD = -O3 -ftree-vectorize -march=native -fno-signed-zeros -ffast-math -std=c11 -mavx2
 	LDFLAGS = -lm
 endif
 
 SOURCES_DEVTEST = devtest.c
 SOURCES_DEVGUI  = devgui.c
-
-TARGETS = devtest devgui
+SOURCES_PCAP24  = pcap24.c
+TARGETS = devtest devgui pcap24
 
 all: $(TARGETS)
 
@@ -59,6 +59,7 @@ SDL_LDFLAGS := $(shell sdl2-config --libs) -lSDL2_ttf
 
 devgui: libtimelinedb.a $(SOURCES_DEVGUI)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o devgui $(SOURCES_DEVGUI) libtimelinedb.a $(SDL_LDFLAGS) $(LDFLAGS)
-
+pcap24: libtimelinedb.a $(SOURCES_PCAP24)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o pcap24 $(SOURCES_PCAP24) libtimelinedb.a $(SDL_LDFLAGS) $(LDFLAGS) -lpcap
 clean:
 	rm -f $(TARGETS) *.o libtimelinedb.a
