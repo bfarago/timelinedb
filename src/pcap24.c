@@ -20,8 +20,8 @@
 
 #define MAXBUFF 500
 
-#define MAX_TIMELINE_CHANNELS 64
-#define MAX_TIMELINE_BUFS 8
+#define MAX_TIMELINE_CHANNELS 80
+#define MAX_TIMELINE_BUFS (MAX_TIMELINE_CHANNELS >> 3) // 8 channels per buffer
 #define MAX_TIMELINE_SAMPLES 1000000
 #define DELAY_SCREEN_REFRESH (1000 / 30 )
 
@@ -219,6 +219,11 @@ int parse_ethPayload1(const u_char *payload, int num_channels, int sample_idx) {
     }
     return sample_idx + 1; // Return next sample index
 }
+
+uint32_t g_count_eth_ok = 0;
+uint32_t g_count_eth_drop_mac = 0;
+uint32_t g_count_eth_drop_unk = 0;
+
 void db_update(Uint32 timestamp){
     (void)timestamp; // Not in use now
 
@@ -234,7 +239,7 @@ void db_update(Uint32 timestamp){
     }
 
     // Parameters
-    const int skip_bytes = 14; // Ethernet header, set it for the first data index!
+    int skip_bytes = 14; // Ethernet header, set it for the first data index!
     const int bytes_per_channel = 3;    // 24 bit/channel
 
     // Buffer init
@@ -255,13 +260,49 @@ void db_update(Uint32 timestamp){
 
     // iterate through a pcap file, while there are data and space in the buffer
     while (pcap_next_ex(g_pcap_handle, &header, &pkt_data) == 1) {
-        // Compute detected channels in this packet
+        // DSTMAC ellenőrzése
+        int is_filter_ok = 1;
+        for (int i = 0; i < 6; i++) {
+            if (pkt_data[i] != 0xFF) {
+                is_filter_ok = 0;
+                break;
+            }
+        }
+        const u_char srcmac_prefix[3] = {0x00, 0x04, 0xC4};
+        for (int i = 0; i < 3; i++) {
+            if (pkt_data[6 + i] != srcmac_prefix[i]) {
+                is_filter_ok = 0;
+                break;
+            }
+        }
+        if (!is_filter_ok) {
+            g_count_eth_drop_mac++;
+            continue; // skip non-broadcast packets
+        }
+
+        uint16_t ethertype = (pkt_data[12] << 8) | pkt_data[13];
+        switch (ethertype) {
+        case 0x00DD: //Monitor
+        case 0xDD00: //Ext
+        case 0x04EE: //SQ
+            skip_bytes = 14;
+        break;
+        default:
+            g_count_eth_drop_unk++;
+            fprintf(stderr, "Unknown Ethertype: 0x%04X\n", ethertype);
+            is_filter_ok = 0;
+        break;
+        }
+        if (!is_filter_ok) {
+            continue;
+        }
         int available_bytes = header->caplen - skip_bytes;
         int detected_channels = available_bytes / bytes_per_channel;
 
         if (detected_channels <= 0) {
             continue; // no valid sample data
         }
+        g_count_eth_ok++;
         // Update global number of channels if needed
         if (g_number_of_channels == 0 || g_number_of_channels > detected_channels) {
             g_number_of_channels = detected_channels;
@@ -423,6 +464,7 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
             curve->offsety - (int)(v2 * curve->scale));
     }
 }
+
 void draw_time_label(SDL_Renderer *renderer, int x, int y, const char* label) {
     SDL_Color textColor = {255, 255, 255, 255};
     SDL_Surface *textSurface = TTF_RenderText_Blended(g_font_axis, label, textColor);
@@ -469,7 +511,12 @@ void draw_time_axis(SDL_Renderer *renderer, Uint32 timestamp) {
     // Estimate the visible sample range (if following, offset is at the end)
     int visible_samples = (int)( ref_buf_min->nr_of_samples / g_zoom_level);
     int inOffset = (int)(g_view_offset / g_zoom_level);
-    int start_sample = g_follow_mode ? (total_samples - visible_samples) : inOffset;
+    if (total_samples & 0x80000000ul) {
+        fprintf(stderr, "Error: Total samples number can not be indexed on signed int.\n");
+        return;
+    }
+
+    int start_sample = g_follow_mode ? ((int)total_samples - visible_samples) : inOffset;
     if (start_sample < 0) start_sample = 0;
     // Each pixel represents how many samples?
     float samples_per_pixel = (visible_samples > 0) ? (float)visible_samples / plot_area_w : 1.0f;

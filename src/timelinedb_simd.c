@@ -77,6 +77,10 @@ int init_InterpInfo(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *out
     uint32_t new_nr_samples=output->nr_of_samples;
 
     SampleInterpInfo *interp_array = (SampleInterpInfo*)malloc(new_nr_samples * sizeof(SampleInterpInfo));
+    if (!interp_array) {
+        fprintf(stderr, "ERROR: Memory allocation failed for SampleInterpInfo\n");
+        return -1;
+    }
     output->prepared_data_src = interp_array;
 
     for (uint32_t i = 0; i < new_nr_samples; ++i) {
@@ -291,7 +295,12 @@ int aggregate_minmax_SIMD_s16x8_avx(const RawTimelineValuesBuf *input, RawTimeli
         __m128i max_s16 = _mm_set1_epi16(INT16_MIN);
 
         for (uint32_t j = start; j < end; ++j) {
-            int16_t sample = ((int16_t*)input->valueBuffer)[j * input->nr_of_channels + ch];
+            uint32_t idx = j * input->nr_of_channels + ch;
+            if (idx >= input->nr_of_samples * input->nr_of_channels) {
+                //fprintf(stderr, "Index out of bounds: %u\n", idx);
+                return -1; // Index out of bounds
+            }
+            int16_t sample = ((int16_t*)input->valueBuffer)[idx];
             __m128i current = _mm_set1_epi16(sample);
 
             min_s16 = _mm_min_epi16(min_s16, current);

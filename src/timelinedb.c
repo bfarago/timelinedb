@@ -18,12 +18,18 @@ const TimelineBackendFunctions *g_TimelineBackendFunctions = &gTimelineBackendFu
 
 // -------------------------------------
 static inline void* alloc_raw_aligned(size_t size, uint8_t alignment) {
+    void *ptr = NULL;
     if (alignment <= 1) {
-        return malloc(size);
+        ptr = malloc(size);
     } else {
         size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
-        return aligned_alloc(alignment, aligned_size);
+        ptr = aligned_alloc(alignment, aligned_size);
     }
+    if (!ptr) {
+        fprintf(stderr, "ERROR: Memory allocation failed for size %zu\n", size);
+        return NULL;
+    }
+    return ptr;
 }
 
 void init_RawTimelineValuesBuf(RawTimelineValuesBuf *buf) {
@@ -207,6 +213,10 @@ int prepare_SampleRateConversion(const RawTimelineValuesBuf *input, uint32_t new
 
     //later we can add more commmon sample parameters
     output->sample_rate_info = (SampleRateInfo*)malloc(sizeof(SampleRateInfo));
+    if (!output->sample_rate_info) {
+        fprintf(stderr, "Memory allocation failed for SampleRateInfo\n");
+        return -1;
+    }
     /*
     double in_time_unit = pow(10.0, input->time_exponent);
     double out_time_unit = pow(10.0, output->time_exponent);

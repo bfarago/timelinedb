@@ -108,7 +108,7 @@ void generate_sine_wave(RawTimelineValuesBuf *buf, uint32_t num_samples, uint8_t
         buf->buffer_size = num_samples * num_channels;
         buf->valueBuffer = malloc(buf->buffer_size);
         if (!buf->valueBuffer) {
-            fprintf(stderr, "Memory allocation failed\n");
+            fprintf(stderr, "ERROR: Memory allocation failed\n");
             exit(1);
         }
 
