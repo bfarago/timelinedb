@@ -53,3 +53,9 @@ dkms.conf
 
 # debug information files
 *.dwo
+src/devgui
+src/devtest
+src/genpcap_sq
+src/pcap24
+src/sine32ch.pcap
+src/sine48ch.pcap

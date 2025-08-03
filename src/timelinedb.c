@@ -356,7 +356,7 @@ int prepare_AggregationMinMax(const RawTimelineValuesBuf *input, RawTimelineValu
     return (outMin->valueBuffer && outMax->valueBuffer) ? 0 : -1;
 }
 
-int aggregate_MinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax) {
+int aggregate_MinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t inSamples, uint32_t inOffset) {
     if (!input || !outMin || !outMax) {
         return -1; // Invalid input
     }
@@ -374,14 +374,14 @@ int aggregate_MinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *ou
         return -1; // Unsupported value type
     }
     // run multiple passes to aggregate min and max values
-    uint32_t in_samples = input->nr_of_samples;
+    uint32_t in_samples = (inSamples > 0) ? inSamples : input->nr_of_samples;
     uint32_t out_samples = outMin->nr_of_samples;
     float stride_f = (float)in_samples / (float)out_samples;
     for (uint32_t i = 0; i < out_samples; ++i) {
-        uint32_t start = (uint32_t)floorf(i * stride_f);
-        uint32_t end = (uint32_t)floorf((i + 1) * stride_f);
+        uint32_t start = inOffset + (uint32_t)floorf(i * stride_f);
+        uint32_t end = inOffset + (uint32_t)floorf((i + 1) * stride_f);
         if (end <= start) end = start + 1;
-        if (end > in_samples) end = in_samples;
+        if (end > inOffset + in_samples) end = inOffset + in_samples;
         minmax_fn(input, outMin, outMax, i, start, end);
     }
     return 0;

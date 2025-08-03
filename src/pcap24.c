@@ -1,5 +1,5 @@
 /*
-    File: devgui.c
+    File: pcap24.c
     This file implements a developer GUI for testing and debugging the timeline database functions.
     Author: Barna Farago - MYND-Ideal kft.
     Date: 2025-07-01
@@ -8,19 +8,20 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <stdint.h>
-#include "timelinedb.h"
-#include "timelinedb_util.h"
+#include <stdbool.h>
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <pcap.h>
 #include <sys/types.h>
 #include <limits.h>
+#include "timelinedb.h"
+#include "timelinedb_util.h"
 
 #define MAXBUFF 500
 
-#define MAX_TIMELINE_CHANNELS 32
-#define MAX_TIMELINE_BUFS 4
+#define MAX_TIMELINE_CHANNELS 64
+#define MAX_TIMELINE_BUFS 8
 #define MAX_TIMELINE_SAMPLES 1000000
 #define DELAY_SCREEN_REFRESH (1000 / 30 )
 
@@ -28,6 +29,7 @@
 #define LUT_MASK (LUT_SIZE - 1)
 
 pcap_t *g_pcap_handle;
+const char* g_pcap_filename = NULL;
 
 int g_screen_w = 800;
 int g_screen_h = 600;
@@ -35,6 +37,16 @@ int g_screen_size_changed = 1;
 
 TTF_Font *g_font_label = NULL;
 TTF_Font *g_font_axis = NULL;
+uint16_t g_number_of_channels = MAX_TIMELINE_CHANNELS; // Default number of channels
+uint16_t g_number_of_visible_channels = MAX_TIMELINE_CHANNELS; // Default visible channels
+uint16_t g_first_visible_channel = 0; // First visible channel index
+
+// Global variables for zoom/pan/follow
+float g_zoom_level = 1.0f; // 1.0 means full window
+int g_view_offset = 0;
+int g_follow_mode = 1;
+bool g_aggregation_changed = false;
+bool g_visible_channels_changed = false;
 
 typedef struct {
 //    float s, c;         // aktuális sin és cos
@@ -85,8 +97,8 @@ SignalCurvesView g_signal_curves_view = {
     .right_margin = 50 // Right margin for scrollbar or other UI elements
 };
 static SignalParams g_signal_params[MAX_TIMELINE_CHANNELS];
-const float g_sample_rate = 1000000.0f;
-float g_dt = 1.0f / 1000000.0f;;
+const float g_sample_rate = 48000.0f;
+float g_dt = 1.0f / g_sample_rate;
 
 
 RawTimelineValuesBuf g_timeline_bufs[MAX_TIMELINE_BUFS];
@@ -178,86 +190,54 @@ void db_free() {
     }
 }
 
-/*
-TODO : 
-1) 32x4 sinf cosf can be converted to LUT 
-2) Move to lib simmd.c
-
-Pure C version runtime was: 220ms,
-Rodrigues and avx implementation: 14ms
-@1M sample x 32 channel  
-*/
-// Apple NEON SIMD implementation using Rodrigues formula
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
-#include <arm_neon.h>
-void db_update(Uint32 timestamp){
-    const float t0 = (float)timestamp / 1000.0f;
-    for (int b = 0; b < 4; b++) {
-        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
+int parse_ethPayload1(const u_char *payload, int num_channels, int sample_idx) {
+    for (int ch = 0; ch < num_channels; ch++) {
+        int buf_idx = ch / 8;
+        int buf_ch = ch % 8;
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[buf_idx];
         int16_t* data = (int16_t*)buf->valueBuffer;
-        uint32_t samples = buf->nr_of_samples;
-
-        float amp_f[8], s_f[8], c_f[8], sin_wdt_f[8], cos_wdt_f[8];
-        for (int ch = 0; ch < 8; ++ch) {
-            int global_ch = b * 8 + ch;
-            SignalParams* p = &g_signal_params[global_ch];
-
-            amp_f[ch] = p->amplitude;
-            float w = 2.0f * M_PI * p->frequency;
-            float angle = w * t0 + p->phase;
-            s_f[ch] = sinf(angle);
-            c_f[ch] = cosf(angle);
-            float wdt = w * g_dt;
-            sin_wdt_f[ch] = sinf(wdt);
-            cos_wdt_f[ch] = cosf(wdt);
+        if (!data) {
+            fprintf(stderr, "Buffer not allocated for channel %d in buffer %d\n", ch, buf_idx);
+            continue;
         }
-
-        float32x4_t amp0 = vld1q_f32(&amp_f[0]);
-        float32x4_t amp1 = vld1q_f32(&amp_f[4]);
-        float32x4_t s0 = vld1q_f32(&s_f[0]);
-        float32x4_t s1 = vld1q_f32(&s_f[4]);
-        float32x4_t c0 = vld1q_f32(&c_f[0]);
-        float32x4_t c1 = vld1q_f32(&c_f[4]);
-        float32x4_t sinwdt0 = vld1q_f32(&sin_wdt_f[0]);
-        float32x4_t sinwdt1 = vld1q_f32(&sin_wdt_f[4]);
-        float32x4_t coswdt0 = vld1q_f32(&cos_wdt_f[0]);
-        float32x4_t coswdt1 = vld1q_f32(&cos_wdt_f[4]);
-
-        for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
-            float32x4_t v0 = vmulq_f32(amp0, s0);
-            float32x4_t v1 = vmulq_f32(amp1, s1);
-
-            int32x4_t i32_0 = vcvtq_s32_f32(v0);
-            int32x4_t i32_1 = vcvtq_s32_f32(v1);
-
-            int16x4_t i16_0 = vqmovn_s32(i32_0);
-            int16x4_t i16_1 = vqmovn_s32(i32_1);
-            int16x8_t packed = vcombine_s16(i16_0, i16_1);
-            vst1q_s16(&data[s_idx * 8], packed);
-
-            float32x4_t s0_new = vmlaq_f32(vmulq_f32(s0, coswdt0), c0, sinwdt0);
-            float32x4_t s1_new = vmlaq_f32(vmulq_f32(s1, coswdt1), c1, sinwdt1);
-            float32x4_t c0_new = vmlsq_f32(vmulq_f32(c0, coswdt0), s0, sinwdt0);
-            float32x4_t c1_new = vmlsq_f32(vmulq_f32(c1, coswdt1), s1, sinwdt1);
-
-            s0 = s0_new;
-            s1 = s1_new;
-            c0 = c0_new;
-            c1 = c1_new;
+        int offset = ch * 3;
+        int32_t val = (int32_t)((payload[offset] << 16) | (payload[offset + 1] << 8) | payload[offset + 2]);
+        if (val & 0x00800000ul) val |= ~0x00FFFFFFul; // Sign extend
+        int16_t sval = (int16_t)(val >> 8); // Convert to 16-bit signed
+        // store the sample in the buffer
+        if (sample_idx < MAX_TIMELINE_SAMPLES) {
+            data[sample_idx * 8 + buf_ch] = sval;
         }
     }
+    for (int idx = 0 ; idx < num_channels/8; idx++) {
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[idx];
+        if (sample_idx < MAX_TIMELINE_SAMPLES) {
+            buf->nr_of_samples = sample_idx + 1;
+        }else {
+            buf->nr_of_samples = MAX_TIMELINE_SAMPLES;
+        }
+    }
+    return sample_idx + 1; // Return next sample index
 }
-#else
 void db_update(Uint32 timestamp){
-    (void)timestamp; // Nem használjuk most
+    (void)timestamp; // Not in use now
 
-    // Paraméterek
-    const int skip_bytes = 13; // Pl. Ethernet header, állítsd be ahogy kell!
-    const int channels_per_sample = 32; // 32 csatorna
-    const int bytes_per_channel = 3;    // 24 bit/csatorna
-    const int bytes_per_sample = channels_per_sample * bytes_per_channel;
+    if (g_pcap_handle) {
+        pcap_close(g_pcap_handle);
+        g_pcap_handle = NULL;
+    }
+    char errbuf[PCAP_ERRBUF_SIZE];
+    g_pcap_handle = pcap_open_offline(g_pcap_filename, errbuf);
+    if (!g_pcap_handle) {
+        fprintf(stderr, "Failed to open pcap file: %s\n", errbuf);
+        return;
+    }
 
-    // Buffer inicializálás
+    // Parameters
+    const int skip_bytes = 14; // Ethernet header, set it for the first data index!
+    const int bytes_per_channel = 3;    // 24 bit/channel
+
+    // Buffer init
     for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
         RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
         //int16_t* data = (int16_t*)buf->valueBuffer;
@@ -268,140 +248,99 @@ void db_update(Uint32 timestamp){
     const u_char* pkt_data;
     int sample_idx = 0;
 
-    // Végigmegyünk a pcap fájlon, amíg van adat és van hely a bufferben
+    // Track first and last timestamps
+    struct timeval first_ts = {0};
+    struct timeval last_ts = {0};
+    int got_first_ts = 0;
+
+    // iterate through a pcap file, while there are data and space in the buffer
     while (pcap_next_ex(g_pcap_handle, &header, &pkt_data) == 1) {
-        if (header->caplen < skip_bytes + bytes_per_sample) continue;
+        // Compute detected channels in this packet
+        int available_bytes = header->caplen - skip_bytes;
+        int detected_channels = available_bytes / bytes_per_channel;
+
+        if (detected_channels <= 0) {
+            continue; // no valid sample data
+        }
+        // Update global number of channels if needed
+        if (g_number_of_channels == 0 || g_number_of_channels > detected_channels) {
+            g_number_of_channels = detected_channels;
+        }
+        // Use the minimum between g_number_of_channels and detected_channels for this packet
+        int use_channels = g_number_of_channels;
+        if (use_channels > detected_channels) use_channels = detected_channels;
 
         const u_char* payload = pkt_data + skip_bytes;
-
-        // Minden csatornára kiolvassuk a 3 bájtos előjeles int-et
-        for (int ch = 0; ch < channels_per_sample; ch++) {
-            int buf_idx = ch / 8;
-            int buf_ch = ch % 8;
-            RawTimelineValuesBuf* buf = &g_timeline_bufs[buf_idx];
-            int16_t* data = (int16_t*)buf->valueBuffer;
-
-            // 3 bájtos előjeles int beolvasása (big endian)
-            int32_t val = (int32_t)((payload[ch * 3] << 16) | (payload[ch * 3 + 1] << 8) | (payload[ch * 3 + 2]));
-            // Előjel kiterjesztés 24 bitről 32 bitre
-            if (val & 0x800000) val |= ~0xFFFFFF;
-
-            // 16 bitre vágás (ha kell, lehet skálázni is)
-            int16_t sval = (int16_t)(val >> 8); // vagy csak (int16_t)val, ha nem kell skálázni
-
-            // Minták elhelyezése a bufferben
-            if (sample_idx < buf->nr_of_samples) {
-                data[sample_idx * 8 + buf_ch] = sval;
-                buf->nr_of_samples = sample_idx + 1;
-            }
+        // read the sample data from the payload
+        sample_idx = parse_ethPayload1(payload, use_channels, sample_idx);
+        // Track first and last timestamps
+        if (!got_first_ts) {
+            first_ts = header->ts;
+            got_first_ts = 1;
         }
-        sample_idx++;
+        last_ts = header->ts;
         if (sample_idx >= MAX_TIMELINE_SAMPLES) break;
     }
-}
-#endif
-
-#if 0
-void db_update3(Uint32 timestamp) {
-    const float t0 = (float)timestamp / 1000.0f;
-    for(uint8_t gch = 0; gch < MAX_TIMELINE_CHANNELS; gch++){
-        SignalParams* p = &g_signal_params[gch];
-        SignalGenState *sgs = &p->st;
-        RawTimelineValuesBuf* buf = sgs->buf;
-        int16_t* data = (int16_t*)buf->valueBuffer;
-
-        float phase = p->phase;
-        float amp = p->amplitude;
-        float w = sgs->w;
-        uint32_t samples = buf->nr_of_samples;
-        uint32_t channels = 8;
-        uint8_t ch = gch & 7;
-        float sin_wdt = sgs->sin_wdt;
-        float cos_wdt = sgs->cos_wdt;
-        
-        float angle = w * t0 + phase;
-        float phase_frac = angle / (2.0f * M_PI); 
-        phase_frac -= (int)phase_frac;
-        if (phase_frac < 0) phase_frac += 1.0f;
-        uint32_t idx = (uint32_t)(phase_frac * LUT_SIZE) & LUT_MASK;
-        float s = sin_lut[idx];
-        float c = cos_lut[idx];
-        
-        for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
-            int16_t sample = (int16_t)(amp * s);
-            data[s_idx * channels + ch] = sample;
-            float s_new = s * cos_wdt + c * sin_wdt;
-            float c_new = c * cos_wdt - s * sin_wdt;
-            s = s_new;
-            c = c_new;
-        }
+    if (g_number_of_channels < g_number_of_visible_channels) {
+        g_number_of_visible_channels = g_number_of_channels;
     }
-}   
+    if (g_first_visible_channel + g_number_of_visible_channels > g_number_of_channels) {
+        g_first_visible_channel = g_number_of_channels - g_number_of_visible_channels;
+    }
+    // Apply zoom/pan/follow: select visible sample range
+    int total_samples = sample_idx;
+    int visible_samples = (int)(total_samples / g_zoom_level);
+    int start_sample = 0;
+    if (g_follow_mode) {
+        start_sample = total_samples - visible_samples;
+        if (start_sample < 0) start_sample = 0;
+        if (start_sample + visible_samples > total_samples) {
+            start_sample = total_samples - visible_samples;
+            if (start_sample < 0) start_sample = 0;
+        }
+        g_view_offset = start_sample; // Update view offset to match follow mode
+    } else {
+        start_sample = g_view_offset;
+    }
 
+    // After reading packets, compute total_time_sec for each buffer.
+    double total_time_sec = 0.0;
+    int sample_count = sample_idx;
+    if (got_first_ts && sample_count > 1) {
+        total_time_sec = (last_ts.tv_sec - first_ts.tv_sec) + (last_ts.tv_usec - first_ts.tv_usec) / 1e6;
+    } else if (got_first_ts && sample_count == 1) {
+        total_time_sec = 0.0;
+    }
+    for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
+        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
+        buf->total_time_sec = total_time_sec;
+        buf->time_step = (uint32_t)(total_time_sec * 1000000000.0 / sample_count); // in microseconds
+        buf->time_exponent = -9; // microseconds
+    }
 
-void db_update1(Uint32 timestamp) {
-    const float sample_rate = 1000000.0f;
-    const float t0 = (float)timestamp / 1000.0f;
-
+    // For each buffer, copy only the visible samples into the buffer's valueBuffer (in-place, so that aggregation uses only visible samples)
     for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
         RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
         int16_t* data = (int16_t*)buf->valueBuffer;
-        uint32_t samples = buf->nr_of_samples;
-        uint32_t channels = buf->nr_of_channels;
-
-        for (uint32_t s = 0; s < samples; s++) {
-            float t = t0 + (float)s / sample_rate;
-            for (uint32_t ch = 0; ch < channels; ch++) {
-                int global_ch = b * 8 + ch;
-                SignalParams* p = &g_signal_params[global_ch];
-                float value = p->amplitude * sinf(2.0f * M_PI * p->frequency * t + p->phase);
-                int16_t sample = (int16_t)value;
-                data[s * channels + ch] = sample;
+        if (buf->nr_of_samples > 0) {
+            int nsamp = buf->nr_of_samples;
+            int nchan = buf->nr_of_channels;
+            int ncopy = visible_samples;
+            if (start_sample + ncopy > nsamp) ncopy = nsamp - start_sample;
+            if (ncopy < 0) ncopy = 0;
+            if (ncopy > 0 && (start_sample > 0 || ncopy < nsamp)) {
+                // Move only visible samples to the front of the buffer
+                for (int i = 0; i < ncopy; ++i) {
+                    for (int ch = 0; ch < nchan; ++ch) {
+                        data[i * nchan + ch] = data[(start_sample + i) * nchan + ch];
+                    }
+                }
+                buf->nr_of_samples = ncopy;
             }
         }
     }
 }
-void db_update2(Uint32 timestamp) {
-    const float sample_rate = 1000000.0f;
-    const float t0 = (float)timestamp / 1000.0f;
-    // Δt = 1/sample_rate
-    float dt = 1.0f / sample_rate;
-    for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
-        RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
-        int16_t* data = (int16_t*)buf->valueBuffer;
-        uint32_t samples = buf->nr_of_samples;
-        uint32_t channels = buf->nr_of_channels;
 
-        for (uint32_t ch = 0; ch < channels; ch++) {
-            int global_ch = b * 8 + ch;
-            SignalParams* p = &g_signal_params[global_ch];
-
-            float f = p->frequency;
-            float w = 2.0f * M_PI * f;
-            float phase = p->phase;
-            float amp = p->amplitude;
-            float wdt = w * dt;
-
-            // rekurzív sin hullámgenerátor (Rodrigues-formula)
-            float sin_wdt = sinf(wdt);
-            float cos_wdt = cosf(wdt);
-            float s = sinf(w * t0 + phase);
-            float c = cosf(w * t0 + phase);
-
-            for (uint32_t s_idx = 0; s_idx < samples; s_idx++) {
-                int16_t sample = (int16_t)(amp * s);
-                data[s_idx * channels + ch] = sample;
-
-                // rekurzív következő sin/cos érték
-                float s_new = s * cos_wdt + c * sin_wdt;
-                float c_new = c * cos_wdt - s * sin_wdt;
-                s = s_new;
-                c = c_new;
-            }
-        }
-    }
-} 
-#endif
 void init_fonts() {
     #ifdef APPLE
     g_font_label = TTF_OpenFont("/System/Library/Fonts/Supplemental/Arial.ttf", 12);
@@ -437,6 +376,7 @@ void SDL_DrawText(SDL_Renderer* renderer, const char* text, int x, int y) {
     SDL_DestroyTexture(texture);
     SDL_FreeSurface(surface);
 }
+
 void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
     if (!curve || !curve->buf || !curve->min_buf || !curve->max_buf) return;
 
@@ -453,9 +393,9 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
     SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
     SDL_RenderDrawLine(renderer,
         0,
-        curve->offsety + curve->height,
+        curve->offsety ,
         g_screen_w,
-        curve->offsety + curve->height);
+        curve->offsety);
 
     // Restore curve color
     SDL_SetRenderDrawColor(renderer, (curve->color >> 16) & 0xFF, (curve->color >> 8) & 0xFF, curve->color & 0xFF, 255);
@@ -483,94 +423,185 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
             curve->offsety - (int)(v2 * curve->scale));
     }
 }
-void draw_time_label(SDL_Renderer *renderer, int x, int t_ms) {
-    char label[16];
-    snprintf(label, sizeof(label), "%d ms", t_ms);
-
+void draw_time_label(SDL_Renderer *renderer, int x, int y, const char* label) {
     SDL_Color textColor = {255, 255, 255, 255};
     SDL_Surface *textSurface = TTF_RenderText_Blended(g_font_axis, label, textColor);
     if (!textSurface) return;
-
     SDL_Texture *textTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
     if (!textTexture) {
         SDL_FreeSurface(textSurface);
         return;
     }
-
     int text_w = textSurface->w;
     int text_h = textSurface->h;
-    SDL_Rect dstRect = { x - text_w / 2, 50, text_w, text_h };
-
+    SDL_Rect dstRect = { x - text_w / 2, 50+y, text_w, text_h };
     SDL_RenderCopy(renderer, textTexture, NULL, &dstRect);
     SDL_DestroyTexture(textTexture);
     SDL_FreeSurface(textSurface);
 }
+
+// Draws dynamic timeline axis with ticks and labels based on zoom and offset
 void draw_time_axis(SDL_Renderer *renderer, Uint32 timestamp) {
-(void)timestamp; // Unused in this example
+    (void)timestamp; // Unused
     const int top = 50; // Top position for the time axis
     const int axis_height = g_signal_curves_view.start_y - top;
-    const int time_range_ms = 1000;
-    const int tick_interval_ms = 10;       // fine
-    const int middle_interval_ms = 50;       // middle
-    const int major_tick_interval_ms = 100; // coarse
     const int label_width = g_signal_curves_view.label_width;
     const int right_margin = g_signal_curves_view.right_margin;
     const int plot_area_w = g_screen_w - label_width - right_margin;
-    const float pixels_per_ms = (float)plot_area_w / time_range_ms;
-    const int axisline_height = g_screen_h - top - 50; // 50px for bottom margin
 
-    // Reset timestamp to 0 for axis drawing due to the first pixel column is always 0 (or user choose it by scrolling)
-    timestamp = 0;
-    // Vonalak és szöveg színe
-    SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255); // halványabb szürke
+    // Draw axis background
+    SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255);
     SDL_Rect axis_rect = {0, top, g_screen_w, axis_height};
     SDL_RenderFillRect(renderer, &axis_rect);
+    
+    // Use the first buffer as reference
+    RawTimelineValuesBuf* ref_buf = g_signal_curves[0].buf;
+    RawTimelineValuesBuf* ref_buf_min = g_signal_curves[0].min_buf;
 
-    for (int t = 0; t <= time_range_ms; t += tick_interval_ms) {
-        int x = label_width + (int)(t * pixels_per_ms);
-        if (x >= g_screen_w - right_margin) break;
+    // How many original samples are visible on-screen?
+    uint32_t total_samples = 0;
+    for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
+        uint32_t sampleshere = g_timeline_bufs[i].nr_of_samples;
+        if (sampleshere > total_samples)
+            total_samples = sampleshere;
+    }
 
-        if (t % major_tick_interval_ms == 0) {
-            SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
-            draw_time_label(renderer, x, t);
-        } else if (t % middle_interval_ms == 0) {
-            SDL_SetRenderDrawColor(renderer, 64, 64, 64, 255);
-        } else if (t % tick_interval_ms == 0) {
-            SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
-        } else {
-            continue; // Skip drawing for non-tick intervals
+    // Estimate the visible sample range (if following, offset is at the end)
+    int visible_samples = (int)( ref_buf_min->nr_of_samples / g_zoom_level);
+    int inOffset = (int)(g_view_offset / g_zoom_level);
+    int start_sample = g_follow_mode ? (total_samples - visible_samples) : inOffset;
+    if (start_sample < 0) start_sample = 0;
+    // Each pixel represents how many samples?
+    float samples_per_pixel = (visible_samples > 0) ? (float)visible_samples / plot_area_w : 1.0f;
+    float pixels_per_sample = (visible_samples > 0) ? (float)plot_area_w / visible_samples : 1.0f;
+
+    // Minimum pixel spacing between ticks (labels should not overlap)
+    const int min_tick_pixel_spacing = 80;
+    // Find a suitable tick spacing in samples
+    // Try powers of 10, 2*10^x, 5*10^x for nice labels
+    int tick_spacing_samples = 1;
+    float tick_pixel_spacing = 0.0f;
+    int tick_spacing_options[] = {1,2,5};
+    int mult = 1;
+    while (1) {
+        for (int i=0;i<3;++i) {
+            int spacing = tick_spacing_options[i]*mult;
+            tick_pixel_spacing = spacing * pixels_per_sample;
+            if (tick_pixel_spacing >= min_tick_pixel_spacing) {
+                tick_spacing_samples = spacing;
+                goto found_spacing;
+            }
         }
-        SDL_RenderDrawLine(renderer, x, top, x, axisline_height);
+        mult *= 10;
+        if (mult > 100000000) break;
+    }
+found_spacing:;
+
+    double time_ms = start_sample * ref_buf->time_step * pow(10.0, ref_buf->time_exponent);
+    char label[64];
+    snprintf(label, sizeof(label), "%.3f sec", time_ms);
+    draw_time_label(renderer, label_width/2, 0, label);
+    snprintf(label, sizeof(label), "%d sample", start_sample);
+    draw_time_label(renderer, label_width/2, 16, label);
+    double srate = 0;
+    const char* srate_unit = "Hz";
+    getEngineeringSampleRateFrequency(ref_buf, &srate, &srate_unit);
+    snprintf(label, sizeof(label), "Freq: %d %s", (int)srate, srate_unit);
+    draw_time_label(renderer, label_width/2, 32, label);
+
+    // Decide: show sample index or milliseconds?
+    int show_ms = (g_sample_rate > 10.0f && samples_per_pixel < g_sample_rate/1000.0f);
+
+    // Compute the first visible tick (aligned to tick_spacing_samples)
+    int first_tick_sample = ((start_sample + tick_spacing_samples - 1) / tick_spacing_samples) * tick_spacing_samples;
+    int last_visible_sample = start_sample + visible_samples;
+
+    // Draw ticks and labels
+    for (int tick_sample = first_tick_sample; tick_sample <= last_visible_sample; tick_sample += tick_spacing_samples) {
+        int px = label_width + (int)((tick_sample - start_sample) * pixels_per_sample);
+        if (px >= g_screen_w - right_margin) break;
+        // Major tick every N ticks
+        int is_major = ((tick_sample / tick_spacing_samples) % 5 == 0);
+        if (is_major)
+            SDL_SetRenderDrawColor(renderer, 128, 128, 128, 255);
+        else
+            SDL_SetRenderDrawColor(renderer, 64, 64, 64, 255);
+        SDL_RenderDrawLine(renderer, px, top, px, g_screen_h - 50); // Draw vertical line from top to bottom
+        // Draw label for major ticks only
+        if (1) {
+            char label[32];
+            if (show_ms) {
+                float t_ms = (float)tick_sample * 1000.0f / g_sample_rate;
+                if (t_ms < 1.0f)
+                    snprintf(label, sizeof(label), "%.2f ms", t_ms);
+                else if (t_ms < 10.0f)
+                    snprintf(label, sizeof(label), "%.1f ms", t_ms);
+                else
+                    snprintf(label, sizeof(label), "%.0f ms", t_ms);
+            } else {
+                snprintf(label, sizeof(label), "%.1f s", ( tick_sample / g_sample_rate));
+            }
+            draw_time_label(renderer, px, is_major?0:16, label);
+        }
     }
 }
 void draw_curves(SDL_Renderer* renderer) {
-    for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
-        if (g_signal_curves[i].buf && g_signal_curves[i].buf->valueBuffer) {
-            draw_one_curve(renderer, &g_signal_curves[i]);
+    for (int i = 0; i < g_number_of_visible_channels; i++) {
+        int idx = i + g_first_visible_channel;
+        if (g_signal_curves[idx].buf && g_signal_curves[idx].buf->valueBuffer) {
+            draw_one_curve(renderer, &g_signal_curves[idx]);
         }
     }
 }
+
 void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
     (void)timestamp; // Unused in this example
     if (g_screen_size_changed) {
         g_screen_size_changed = 0;
+        g_visible_channels_changed = true;
         for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
             free_RawTimelineValuesBuf(&g_timeline_min[i]);
             free_RawTimelineValuesBuf(&g_timeline_max[i]);
             alloc_RawTimelineValuesBuf(&g_timeline_min[i], g_screen_w, 8, 16, 16, TR_SIMD_sint16x8);
             alloc_RawTimelineValuesBuf(&g_timeline_max[i], g_screen_w, 8, 16, 16, TR_SIMD_sint16x8);
-            prepare_AggregationMinMax(&g_timeline_bufs[i], &g_timeline_min[0], &g_timeline_max[0], g_screen_w);
+            // prepare_AggregationMinMax now takes visible sample count (dynamic)
+            int agg_samples = g_screen_w;
+            prepare_AggregationMinMax(&g_timeline_bufs[i], &g_timeline_min[0], &g_timeline_max[0], agg_samples);
         }
         g_signal_curves_view.middle_offset = g_screen_h / 2;
         g_signal_curves_view.height = g_screen_h - g_signal_curves_view.start_y - 50; // 50px for bottom margin
-        for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
-            g_signal_curves[i].height = g_signal_curves_view.height / MAX_TIMELINE_CHANNELS;
-            g_signal_curves[i].offsety = g_signal_curves_view.start_y + i * g_signal_curves[i].height;
-            g_signal_curves[i].scale = (float)g_signal_curves[i].height / 65536.0f; // Scale to fit in height
+    }
+    if (g_visible_channels_changed) {
+        g_visible_channels_changed = false;
+        for (int i = 0; i < g_number_of_visible_channels; i++) {
+            int idx = i + g_first_visible_channel;
+            uint32_t h = g_signal_curves_view.height / g_number_of_visible_channels;  //todo: visible number of channels
+            g_signal_curves[idx].height = h;
+            g_signal_curves[idx].offsety = g_signal_curves_view.start_y + i * h + h / 2;
+            g_signal_curves[idx].scale = (float)h / 65536.0f; // Scale to fit in height
         }     
     }
+    // Dynamic aggregation: aggregation width depends on zoom level
+    int agg_samples = g_screen_w;
+    int inSamples = (int)(agg_samples / g_zoom_level);
+    int inOffset = (int)(g_view_offset / g_zoom_level);
+    double window_time_sec = g_timeline_bufs[0].total_time_sec / g_zoom_level;
+    int exp= g_timeline_bufs[0].time_exponent;
+    int tsteps = g_timeline_bufs[0].time_step;
+    if (inSamples > 0) {
+        double tstep = window_time_sec / inSamples;
+        exp = (int)floor(log10(tstep)/3)*3;
+        if (exp < -12) exp = -12;
+        tsteps = (int)round(tstep * pow(10, -exp));
+    }
     for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
-        aggregate_MinMax(&g_timeline_bufs[i], &g_timeline_min[i], &g_timeline_max[i]);
+        aggregate_MinMax(&g_timeline_bufs[i], &g_timeline_min[i], &g_timeline_max[i], inSamples, inOffset);
+        g_timeline_min[i].total_time_sec = window_time_sec;
+        g_timeline_min[i].time_step = tsteps;
+        g_timeline_min[i].time_exponent = exp;
+        g_timeline_max[i].total_time_sec = window_time_sec;
+        g_timeline_max[i].time_step = tsteps;
+        g_timeline_max[i].time_exponent = exp;
     }
     if (!renderer) {
         SDL_Log("Failed to get renderer");
@@ -581,28 +612,62 @@ void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Set color for min/max lines
     draw_time_axis(renderer, timestamp);
     draw_curves(renderer);
+
+    // --- Draw follow mode status overlay ---
+    char follow_status[32];
+    snprintf(follow_status, sizeof(follow_status), "Follow mode: %s", g_follow_mode ? "ON" : "OFF");
+    SDL_DrawText(renderer, follow_status, 10, 10); // Adjust coordinates as needed
+    // --- End overlay ---
+
     SDL_RenderPresent(renderer);
 }
 void on_timer_tick(Uint32 timestamp, SDL_Renderer* renderer) {
-    db_update(timestamp);
+    if (g_follow_mode || g_aggregation_changed) {
+        g_aggregation_changed = false;
+        db_update(timestamp);
+    }
     screen_update(timestamp, renderer);
 }
 
-int main(int argc, char *argv[]) {
+void processWheel(int dy, bool zoom, int mouse_x) {
+    if (mouse_x > g_signal_curves_view.label_width) {
+        // existing zoom or scroll logic for the graph area
+        if (zoom) {
+            if (dy > 0) g_zoom_level *= 1.1f;
+            else if (dy < 0) g_zoom_level /= 1.1f;
+            if (g_zoom_level < 0.0001f) g_zoom_level = 0.0001f;
+            g_aggregation_changed = true;
+        } else {
+            g_view_offset += dy * 1000.0 * g_zoom_level; // Adjust the offset based on zoom level
+            if (g_view_offset < 0) g_view_offset = 0;
+            g_follow_mode = 0;
+            g_aggregation_changed = true;
+        }
+    } else {
+        if (zoom) {
+            if (dy > 0 && g_number_of_visible_channels < g_number_of_channels) g_number_of_visible_channels++;
+            else if (dy < 0 && g_number_of_visible_channels > 1) g_number_of_visible_channels--;
+            g_visible_channels_changed = true;
+        }else{
+            if (dy > 0 && g_first_visible_channel > 0) {
+                g_first_visible_channel--;
+                g_aggregation_changed = true;
+            } else if (dy < 0 && g_first_visible_channel + g_number_of_visible_channels < g_number_of_channels) {
+                g_first_visible_channel++;
+                g_aggregation_changed = true;
+            }
+            g_visible_channels_changed = true;
+        }
+    }
+}
 
-    char errbuf[PCAP_ERRBUF_SIZE];
-    //const u_char *packet;
-    // struct pcap_pkthdr header;
+int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <pcap_file>\n", argv[0]);
         return 1;
     }
-
-    g_pcap_handle = pcap_open_offline(argv[1], errbuf);
-    if (!g_pcap_handle) {
-        fprintf(stderr, "Couldn't open file: %s\n", errbuf);
-        return 1;
-    }
+    g_pcap_filename = argv[1];
+    g_pcap_handle = NULL;
     SDL_Init(SDL_INIT_VIDEO);
     TTF_Init();
     init_fonts();
@@ -641,6 +706,17 @@ int main(int argc, char *argv[]) {
                     g_screen_size_changed = 1;
                     screen_update(now, renderer);
                 }
+            }
+            if (event.type == SDL_MOUSEWHEEL) {
+                const Uint8 *keystate = SDL_GetKeyboardState(NULL);
+                bool zoom = (keystate[SDL_SCANCODE_LSHIFT] || keystate[SDL_SCANCODE_RSHIFT]);
+                int mouse_x = 0, mouse_y = 0;
+                SDL_GetMouseState(&mouse_x, &mouse_y);
+                processWheel(event.wheel.y, zoom, mouse_x);
+            }
+            if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_f) {
+                g_follow_mode = !g_follow_mode;
+                g_aggregation_changed = true;
             }
         }
         int32_t elapsed = now - last_timer;

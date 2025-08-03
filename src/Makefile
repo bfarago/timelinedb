@@ -35,7 +35,8 @@ endif
 SOURCES_DEVTEST = devtest.c
 SOURCES_DEVGUI  = devgui.c
 SOURCES_PCAP24  = pcap24.c
-TARGETS = devtest devgui pcap24
+SOURCES_GENPCAP_SQ  = genpcap_sq.c
+TARGETS = devtest devgui pcap24 genpcap_sq
 
 all: $(TARGETS)
 
@@ -61,5 +62,8 @@ devgui: libtimelinedb.a $(SOURCES_DEVGUI)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o devgui $(SOURCES_DEVGUI) libtimelinedb.a $(SDL_LDFLAGS) $(LDFLAGS)
 pcap24: libtimelinedb.a $(SOURCES_PCAP24)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o pcap24 $(SOURCES_PCAP24) libtimelinedb.a $(SDL_LDFLAGS) $(LDFLAGS) -lpcap
+genpcap_sq: libtimelinedb.a $(SOURCES_GENPCAP_SQ)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -o genpcap_sq $(SOURCES_GENPCAP_SQ) libtimelinedb.a $(SDL_LDFLAGS) $(LDFLAGS) -lpcap
+clean:
 clean:
 	rm -f $(TARGETS) *.o libtimelinedb.a

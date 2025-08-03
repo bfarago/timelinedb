@@ -49,6 +49,7 @@ typedef struct {
     uint32_t buffer_size;
     uint32_t nr_of_samples;
     uint32_t time_step; // per sample in units given by time_exponent
+    double   total_time_sec; // total duration covered by the raw samples
     int8_t   time_exponent;
     uint8_t  nr_of_channels;
     uint8_t  bitwidth;
@@ -84,6 +85,6 @@ int convert_to_NeonAlignedBuffer(const RawTimelineValuesBuf *src, RawTimelineVal
 int convert_from_NeonAlignedBuffer(const RawTimelineValuesBuf *src, RawTimelineValuesBuf *dst);
 
 int prepare_AggregationMinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t outSampleNr);
-int aggregate_MinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax);
+int aggregate_MinMax(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t inSamples, uint32_t inOffset);
 
 #endif

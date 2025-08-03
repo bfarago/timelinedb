@@ -130,7 +130,7 @@ int main(int argc, char *argv[]) {
     init_RawTimelineValuesBuf(&so_min);
     init_RawTimelineValuesBuf(&so_max);
     prepare_AggregationMinMax(&simd_input, &so_min, &so_max, 20);
-    aggregate_MinMax(&simd_input, &so_min, &so_max);
+    aggregate_MinMax(&simd_input, &so_min, &so_max, simd_input.nr_of_samples, 0);
     dump_RawTimelineValuesBuf(&so_min);
     dump_RawTimelineValuesBuf(&so_max);
     free_RawTimelineValuesBuf(&so_min);

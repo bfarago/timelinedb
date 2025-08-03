@@ -565,7 +565,7 @@ void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
         }     
     }
     for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
-        aggregate_MinMax(&g_timeline_bufs[i], &g_timeline_min[i], &g_timeline_max[i]);
+        aggregate_MinMax(&g_timeline_bufs[i], &g_timeline_min[i], &g_timeline_max[i], g_timeline_bufs[i].nr_of_samples, 0);
     }
     if (!renderer) {
         SDL_Log("Failed to get renderer");
