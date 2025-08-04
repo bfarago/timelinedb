@@ -21,8 +21,8 @@ int main(int argc, char *argv[]) {
     const int frame_payload_bytes = num_channels * 3;
     const int frame_size = start_payload + frame_payload_bytes;
     const uint8_t dst_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-    const uint8_t src_mac[6] = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc};
-    const uint16_t ethertype = 0x88b5;
+    const uint8_t src_mac[6] = {0x00, 0x04, 0xc4, 0x78, 0x9a, 0xbc};
+    const uint16_t ethertype = 0x00DD; // Custom Ethertype for AH SQ Monitor
     const double freq_start = 15000.0;
     const double freq_end = 10.0;
     const double am_freq = 10.0;
