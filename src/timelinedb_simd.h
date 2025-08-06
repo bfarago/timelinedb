@@ -24,6 +24,7 @@ typedef struct TimelineBackendFunctions {
     fn_convert          convert_sample_rate_s16x8;
     fn_aggregate_minmax aggregate_minmax_s8;
     fn_aggregate_minmax aggregate_minmax_s16x8;
+    fn_aggregate_minmax aggregate_minmax_s24x8;
 } TimelineBackendFunctions;
 
 //Backend templates

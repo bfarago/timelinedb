@@ -143,6 +143,24 @@ int getSampleValue_SIMD_sint16x8(const RawTimelineValuesBuf *buf, uint32_t sampl
     *value = *(int16_t*)(&buf->valueBuffer[offset]);
     return 0;
 }
+int getSampleValue_SIMD_sint24x8(const RawTimelineValuesBuf *buf, uint32_t sample_index, uint8_t channel, int32_t *value) {
+    if (!buf || !value || sample_index >= buf->nr_of_samples || channel >= buf->nr_of_channels || buf->bitwidth != 24) {
+        return -1; // Invalid access
+    }
+    uint32_t offset;
+    if (getSampleByteOffset(buf, sample_index, channel, &offset) != 0) {
+        return -1; // Invalid sample access
+    }
+    const uint8_t *src = (const uint8_t*)&buf->valueBuffer[offset];
+    int32_t val = (src[0] | (src[1] << 8) | (src[2] << 16));
+    // Sign extend 24-bit to 32-bit
+    if (val & 0x800000) {
+        val |= ~0xFFFFFF;
+    }
+    *value = val;
+    return 0;
+}
+
 void alloc_RawTimelineValuesBuf(RawTimelineValuesBuf *buf, uint32_t nr_of_samples, uint8_t nr_of_channels, uint8_t bitwidth, uint8_t bytealignment, RawTimelineValueEnum value_type) {
     if (!buf) return;
     buf->nr_of_samples = nr_of_samples;

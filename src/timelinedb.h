@@ -28,7 +28,8 @@ typedef enum {
     TR_analog_sint8,
     TR_analog_float32,
     TR_analog_float64,
-    TR_SIMD_sint16x8
+    TR_SIMD_sint16x8,
+    TR_SIMD_sint24x8
 } RawTimelineValueEnum;
 
 typedef struct {
@@ -75,7 +76,7 @@ void getEngineeringTimeInterval(const RawTimelineValuesBuf *buf, double *time_va
 int getSampleValue_int8(const RawTimelineValuesBuf *buf, uint32_t sample_index, uint8_t channel, int8_t *value);
 int getSampleValue_float32(const RawTimelineValuesBuf *buf, uint32_t sample_index, uint8_t channel, float *value);
 int getSampleValue_SIMD_sint16x8(const RawTimelineValuesBuf *buf, uint32_t sample_index, uint8_t channel, int16_t *value);
-
+int getSampleValue_SIMD_sint24x8(const RawTimelineValuesBuf *buf, uint32_t sample_index, uint8_t channel, int32_t *value);
 
 int prepare_SampleRateConversion(const RawTimelineValuesBuf *input, uint32_t new_sample_rate_hz, RawTimelineValuesBuf *output);
 int convert_sample_rate(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *output);

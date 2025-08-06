@@ -271,6 +271,31 @@ int aggregate_minmax_SIMD_s16x8_c(const RawTimelineValuesBuf *input, RawTimeline
     return 0;
 }
 
+/*
+    AGGREGATION MIN/MAX for 24-bit samples, downsample to 8-bit output.
+    This function computes the minimum and maximum values for each channel in the specified range of samples (24-bit signed stored in int32_t),
+    then downscales them to 8-bit signed integers (int8_t) by right-shifting 16 bits (i.e., value >> 16).
+    The output buffers must be int8_t type.
+ */
+int aggregate_minmax_SIMD_s24x8_c(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t i, uint32_t start, uint32_t end) {
+    for (uint8_t ch = 0; ch < input->nr_of_channels; ++ch) {
+        int32_t min_val = INT32_MAX;
+        int32_t max_val = INT32_MIN;
+
+        for (uint32_t j = start; j < end; ++j) {
+            int32_t value;
+            if (getSampleValue_SIMD_sint24x8(input, j, ch, &value) == 0) {
+                if (value < min_val) min_val = value;
+                if (value > max_val) max_val = value;
+            }
+        }
+        // Downscale from 24-bit to 8-bit with rounding (>>16)
+        ((int8_t*)outMin->valueBuffer)[i * input->nr_of_channels + ch] = (int8_t)(min_val >> 16);
+        ((int8_t*)outMax->valueBuffer)[i * input->nr_of_channels + ch] = (int8_t)(max_val >> 16);
+    }
+    return 0;
+}
+
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(NEON_ENABLED)
 int aggregate_minmax_SIMD_s16x8_neon(const RawTimelineValuesBuf *input, RawTimelineValuesBuf *outMin, RawTimelineValuesBuf *outMax, uint32_t i, uint32_t start, uint32_t end) {
     for (uint8_t ch = 0; ch < input->nr_of_channels; ++ch) {
@@ -560,16 +585,19 @@ const TimelineBackendFunctions gTimelineBackendFunctionsSIMD = {
     .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_bresenham_neon, // Use dispatcher
     .aggregate_minmax_s8 = aggregate_minmax_s8_neon,
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_neon,
+    .aggregate_minmax_s24x8 = aggregate_minmax_SIMD_s24x8_c,
 #elif defined(__AVX2__) || defined(__AVX__)
     .name = "Intel AVX2 SIMD Backend",
     .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_bresenham_avx,//convert_sample_rate_SIMD_s16x8_avx, // AVX2 fallback
     .aggregate_minmax_s8 = aggregate_minmax_s8_c, // AVX2 fallback
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_avx, // AVX2 fallback
+    .aggregate_minmax_s24x8 = aggregate_minmax_SIMD_s24x8_c,
 #else   //fallback to C version implemented version of SIMD technology is not available or disabled
     .name = "Fallback C Backend",
     .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_bresenham,
     .aggregate_minmax_s8 = aggregate_minmax_s8_c,
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_c,
+    .aggregate_minmax_s24x8 = aggregate_minmax_SIMD_s24x8_c,
 #endif
 };
 
@@ -579,4 +607,5 @@ const TimelineBackendFunctions gTimelineBackendFunctionsC = {
     .convert_sample_rate_s16x8 = convert_sample_rate_SIMD_s16x8_bresenham, //convert_sample_rate_SIMD_s16x8_c,
     .aggregate_minmax_s8 = aggregate_minmax_s8_c,
     .aggregate_minmax_s16x8 = aggregate_minmax_SIMD_s16x8_c,
+    .aggregate_minmax_s24x8 = aggregate_minmax_SIMD_s24x8_c,
 };

@@ -4,12 +4,20 @@
     Author: Barna Farago - MYND-Ideal kft.
     Date: 2025-07-01
     License: Modified MIT License. You can use it for learn, but I can sell it as closed source with some improvements...
+    Description: This file contains the main loop, event handling, and rendering functions for the timeline database GUI.
+    The main goal is to provide a visual representation of a pcap (Wireshark) stream as athe timeline data, allowing for
+    easy debugging and testing of the timeline database functions. Based on this use-case, we could probably improve the
+    timeline database functions to be more efficient and easier to use, while we can also have a tool to visualize the
+    ethernet traffic in a timeline view. The original problem of the pcap24.c file was to visualize an ethernet frame stream,
+    which contains multiple 24 bit wide samples.
+    TODO:
+     - pcap file partial loading, or continuous loading. Right now, the db_update reads the whole file, which is not efficient for large files.
+     - navigation is very basic, we should implement a better navigation system, like zooming, panning, and following the current time.
 */
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <pcap.h>
@@ -19,51 +27,16 @@
 #include "timelinedb_util.h"
 
 #define MAXBUFF 500
-
 #define MAX_TIMELINE_CHANNELS 80
 #define MAX_TIMELINE_BUFS (MAX_TIMELINE_CHANNELS >> 3) // 8 channels per buffer
-#define MAX_TIMELINE_SAMPLES 1000000
+#define MAX_TIMELINE_SAMPLES (1000 * 1000)
 #define DELAY_SCREEN_REFRESH (1000 / 30 )
 
-#define LUT_SIZE 1024
-#define LUT_MASK (LUT_SIZE - 1)
-
-pcap_t *g_pcap_handle;
-const char* g_pcap_filename = NULL;
-
-int g_screen_w = 800;
-int g_screen_h = 600;
-int g_screen_size_changed = 1;
-
-TTF_Font *g_font_label = NULL;
-TTF_Font *g_font_axis = NULL;
-uint16_t g_number_of_channels = MAX_TIMELINE_CHANNELS; // Default number of channels
-uint16_t g_number_of_visible_channels = MAX_TIMELINE_CHANNELS; // Default visible channels
-uint16_t g_first_visible_channel = 0; // First visible channel index
-
-// Global variables for zoom/pan/follow
-float g_zoom_level = 1.0f; // 1.0 means full window
-int g_view_offset = 0;
-int g_follow_mode = 1;
-bool g_aggregation_changed = false;
-bool g_visible_channels_changed = false;
-
-typedef struct {
-//    float s, c;         // aktuális sin és cos
-    float amplitude;
-    float w;
-    float wdt;
-    float sin_wdt;
-    float cos_wdt;
-    RawTimelineValuesBuf* buf;
-} SignalGenState;
-
-typedef struct {
-    float amplitude;
-    float frequency;
-    float phase;
-    SignalGenState st;
-} SignalParams;
+#define MARGIN_TOP 100
+#define MARGIN_BOTTOM 50
+#define MARGIN_RIGHT 50
+#define MARGIN_LEFT 5
+#define LABEL_WIDTH 100
 
 typedef struct {
     int id;
@@ -80,7 +53,6 @@ typedef struct {
 
 typedef struct {
     int count;
-    int middle_offset; // there is the common offset for all curves
     int start_y;
     int height;
     int label_width;
@@ -90,16 +62,32 @@ typedef struct {
 SignalCurve g_signal_curves[MAX_TIMELINE_CHANNELS];
 SignalCurvesView g_signal_curves_view = {
     .count = MAX_TIMELINE_CHANNELS,
-    .middle_offset = 0,
-    .start_y = 100,
-    .height = 400, // Default height, can be adjusted later
-    .label_width = 100, // Width for channel labels
-    .right_margin = 50 // Right margin for scrollbar or other UI elements
+    .start_y = MARGIN_TOP,
+    .height = 400, // Default height, can be always adjusted later
+    .label_width = LABEL_WIDTH,  // Width for channel labels
+    .right_margin = MARGIN_RIGHT // Right margin for scrollbar or other UI elements
 };
-static SignalParams g_signal_params[MAX_TIMELINE_CHANNELS];
-const float g_sample_rate = 48000.0f;
-float g_dt = 1.0f / g_sample_rate;
 
+pcap_t *g_pcap_handle;
+const char* g_pcap_filename = NULL;
+
+int g_screen_w = 800;
+int g_screen_h = 600;
+bool g_screen_size_changed = true;
+
+TTF_Font *g_font_label = NULL;
+TTF_Font *g_font_axis = NULL;
+
+uint16_t g_number_of_channels = MAX_TIMELINE_CHANNELS; // Default number of channels
+uint16_t g_number_of_visible_channels = MAX_TIMELINE_CHANNELS; // Default visible channels
+uint16_t g_first_visible_channel = 0; // First visible channel index
+
+// Global variables for zoom/pan/follow
+float g_zoom_level = 1.0f; // 1.0 means full window
+int g_view_offset = 0;
+int g_follow_mode = 1;
+bool g_aggregation_changed = false;
+bool g_visible_channels_changed = false;
 
 RawTimelineValuesBuf g_timeline_bufs[MAX_TIMELINE_BUFS];
 RawTimelineValuesBuf g_timeline_min[MAX_TIMELINE_BUFS];
@@ -107,40 +95,23 @@ RawTimelineValuesBuf g_timeline_max[MAX_TIMELINE_BUFS];
 TimelineDB g_timeline_db;
 TimelineEvent g_timeline_events[MAX_TIMELINE_CHANNELS];
 
-float sin_lut[LUT_SIZE];
-float cos_lut[LUT_SIZE];
+float g_sample_rate = 48000.0f; //move to buf later.
+uint32_t g_total_valid_samples = 0; // Total valid samples in the current buffer, move to buf later.
+
+uint32_t g_count_eth_ok = 0;
+uint32_t g_count_eth_drop_mac = 0;
+uint32_t g_count_eth_drop_unk = 0;
 
 void db_init() {
-    for (int i = 0; i < LUT_SIZE; i++) {
-        sin_lut[i] = sinf(2.0f * M_PI * (float)i / LUT_SIZE);
-        cos_lut[i] = cosf(2.0f * M_PI * (float)i / LUT_SIZE);
-    }
-    for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
-        SignalParams* p = &g_signal_params[i];
-        p->amplitude = 10000.0f + (rand() % 20000); // 10000 - 29999
-        p->frequency = 0.1f + ((float)(rand() % 10000) / 10.0f); // 0.1 - 10.0 Hz
-        p->phase = ((float)(rand() % 6283)) / 1000.0f; // 0 - ~2π
-        
-        SignalGenState *sgs = &p->st;
-        sgs->buf = &g_timeline_bufs[ i >> 3 ];
-        float f = p->frequency;
-        float w = 2.0f * M_PI * f;
-        sgs->w = w;
-        float wdt = w * g_dt;
-        sgs->wdt = wdt;
-        sgs->sin_wdt = sinf(wdt);
-        sgs->cos_wdt = cosf(wdt); 
-    }
-    g_signal_curves_view.start_y = 100;
-    g_signal_curves_view.label_width = 100; // Width for channel labels
-    g_signal_curves_view.right_margin = 50; // Right margin for scrollbar or other UI elements
+    g_signal_curves_view.start_y = MARGIN_TOP;
+    g_signal_curves_view.label_width = LABEL_WIDTH; // Width for channel labels
+    g_signal_curves_view.right_margin = MARGIN_RIGHT; // Right margin for scrollbar or other UI elements
 
     for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
         g_timeline_events[i].id = i;
         static char name_buf[64];
         static char desc_buf[128];
         sprintf(name_buf, "signal%03d", i + 1);
-        sprintf(desc_buf, "Auto-generated signal %d", i + 1);
         g_timeline_events[i].name = strdup(name_buf);
         g_timeline_events[i].description = strdup(desc_buf);
         g_signal_curves[i].event = &g_timeline_events[i];
@@ -183,6 +154,8 @@ void db_init() {
 void db_free() {
     for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
         free_RawTimelineValuesBuf(&g_timeline_bufs[i]);
+        free_RawTimelineValuesBuf(&g_timeline_min[i]);
+        free_RawTimelineValuesBuf(&g_timeline_max[i]);
     }
     for (int i = 0; i < MAX_TIMELINE_CHANNELS; i++) {
         free(g_timeline_events[i].name);
@@ -190,6 +163,13 @@ void db_free() {
     }
 }
 
+/**
+ * Parses the Ethernet payload for a single sample and stores it in the appropriate buffer.
+ * @param payload Pointer to the Ethernet payload data.
+ * @param num_channels Number of channels in the sample.
+ * @param sample_idx Index of the sample to store in the buffer.
+ * @return The next sample index after storing the current sample.
+ */
 int parse_ethPayload1(const u_char *payload, int num_channels, int sample_idx) {
     for (int ch = 0; ch < num_channels; ch++) {
         int buf_idx = ch / 8;
@@ -219,10 +199,6 @@ int parse_ethPayload1(const u_char *payload, int num_channels, int sample_idx) {
     }
     return sample_idx + 1; // Return next sample index
 }
-
-uint32_t g_count_eth_ok = 0;
-uint32_t g_count_eth_drop_mac = 0;
-uint32_t g_count_eth_drop_unk = 0;
 
 void db_update(Uint32 timestamp){
     (void)timestamp; // Not in use now
@@ -330,6 +306,7 @@ void db_update(Uint32 timestamp){
     }
     // Apply zoom/pan/follow: select visible sample range
     int total_samples = sample_idx;
+    g_total_valid_samples = total_samples;
     int visible_samples = (int)(total_samples / g_zoom_level);
     int start_sample = 0;
     if (g_follow_mode) {
@@ -352,6 +329,8 @@ void db_update(Uint32 timestamp){
     } else if (got_first_ts && sample_count == 1) {
         total_time_sec = 0.0;
     }
+    g_sample_rate = (float)sample_count / total_time_sec; // Update sample rate based on actual samples read
+
     for (int b = 0; b < MAX_TIMELINE_BUFS; b++) {
         RawTimelineValuesBuf* buf = &g_timeline_bufs[b];
         buf->total_time_sec = total_time_sec;
@@ -395,6 +374,16 @@ void init_fonts() {
         return;
     }
 }
+void free_fonts() {
+    if (g_font_label) {
+        TTF_CloseFont(g_font_label);
+        g_font_label = NULL;
+    }
+    if (g_font_axis) {
+        TTF_CloseFont(g_font_axis);
+        g_font_axis = NULL;
+    }
+}
 
 void SDL_DrawText(SDL_Renderer* renderer, const char* text, int x, int y) {
     SDL_Color white = {255, 255, 255, 255};
@@ -428,7 +417,7 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
 
     SDL_SetRenderDrawColor(renderer, (curve->color >> 16) & 0xFF, (curve->color >> 8) & 0xFF, curve->color & 0xFF, 255);
 
-    int start_x = g_signal_curves_view.label_width;
+    uint32_t start_x = g_signal_curves_view.label_width;
 
     // Draw a horizontal separator line between signal areas
     SDL_SetRenderDrawColor(renderer, 40, 40, 40, 255);
@@ -444,24 +433,34 @@ void draw_one_curve(SDL_Renderer* renderer, const SignalCurve* curve) {
     // Draw signal name (if using SDL_ttf, add actual text rendering here)
     SDL_DrawText(renderer, curve->event->name, 0, curve->offsety);
 
-    int drawable_width = g_screen_w - g_signal_curves_view.label_width - g_signal_curves_view.right_margin;
+    uint32_t drawable_width = g_screen_w - g_signal_curves_view.label_width - g_signal_curves_view.right_margin;
     uint16_t *minp= (uint16_t *)min_buf->valueBuffer;
     uint16_t *maxp= (uint16_t *)max_buf->valueBuffer;
     minp+=curve->channelidx;
     maxp+=curve->channelidx;
     uint8_t d = min_buf->nr_of_channels;
+    uint32_t x = start_x;
     for (uint32_t i = 0; i < nr_of_samples - 1; i++) {
         int16_t v1, v2;
-        //getSampleValue_SIMD_sint16x8(max_buf, i, curve->channelidx, &v1);
-        //getSampleValue_SIMD_sint16x8(min_buf, i, curve->channelidx, &v2);
         v1 = *minp;
         v2 = *maxp;
         minp+= d; maxp+= d;
+        x = start_x + i * drawable_width / nr_of_samples;
         SDL_RenderDrawLine(renderer,
-            start_x + i * drawable_width / nr_of_samples,
+            x,
             curve->offsety - (int)(v1 * curve->scale),
             start_x + (i + 1) * drawable_width / nr_of_samples,
             curve->offsety - (int)(v2 * curve->scale));
+        x = start_x + (i + 1) * drawable_width / nr_of_samples;
+    }
+    if (x < drawable_width) {
+        SDL_Rect fillr =  {
+            x,
+            curve->offsety - (int)(curve->height),
+            drawable_width-x,
+            (int)(curve->height * curve->scale)};
+        SDL_SetRenderDrawColor(renderer, (curve->color >> 16) & 0xFF, (curve->color >> 8) & 0xFF, curve->color & 0xFF, 255);
+        SDL_RenderFillRect(renderer, &fillr);
     }
 }
 
@@ -480,6 +479,35 @@ void draw_time_label(SDL_Renderer *renderer, int x, int y, const char* label) {
     SDL_RenderCopy(renderer, textTexture, NULL, &dstRect);
     SDL_DestroyTexture(textTexture);
     SDL_FreeSurface(textSurface);
+}
+
+void draw_timeline_overview(SDL_Renderer *renderer, const RawTimelineValuesBuf *buf, RawTimelineValuesBuf *aggr) {
+    (void)buf; // Unused, we use aggr for drawing
+    const int bar_height = 8;
+    const int bar_y = 50 - bar_height - 2;
+
+    uint32_t total_samples = g_total_valid_samples;//buf->nr_of_samples;
+    uint32_t view_offset = g_view_offset;
+    uint32_t view_samples = aggr->nr_of_samples;
+
+    float left_ratio = (float)view_offset / total_samples;
+    float middle_ratio = (float)view_samples / total_samples;
+    //float right_ratio = 1.0f - left_ratio - middle_ratio;
+
+    int bar_width = g_screen_w - g_signal_curves_view.right_margin;
+
+    SDL_Rect left_rect   = { 0, bar_y, (int)(bar_width * left_ratio), bar_height };
+    SDL_Rect middle_rect = { left_rect.w, bar_y, (int)(bar_width * middle_ratio), bar_height };
+    SDL_Rect right_rect  = { left_rect.w + middle_rect.w, bar_y, bar_width - (left_rect.w + middle_rect.w), bar_height };
+
+    // background
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderFillRect(renderer, &(SDL_Rect){0, bar_y, bar_width, bar_height});
+
+    // colors
+    SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);  SDL_RenderFillRect(renderer, &left_rect);
+    SDL_SetRenderDrawColor(renderer, 100, 200, 255, 255); SDL_RenderFillRect(renderer, &middle_rect);
+    SDL_SetRenderDrawColor(renderer, 50, 50, 50, 255);  SDL_RenderFillRect(renderer, &right_rect);
 }
 
 // Draws dynamic timeline axis with ticks and labels based on zoom and offset
@@ -601,21 +629,22 @@ void draw_curves(SDL_Renderer* renderer) {
     }
 }
 
+void realloc_RawTimelineValuesBufs(RawTimelineValuesBuf *buf, uint32_t new_w) {
+    free_RawTimelineValuesBuf(buf);
+    alloc_RawTimelineValuesBuf(buf, new_w, // 8, 16, 16, TR_SIMD_sint16x8);
+        buf->nr_of_channels, buf->bitwidth, buf->bytes_per_sample, buf->value_type);
+}
+
 void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
     (void)timestamp; // Unused in this example
     if (g_screen_size_changed) {
-        g_screen_size_changed = 0;
+        g_screen_size_changed = false;
         g_visible_channels_changed = true;
         for (int i = 0; i < MAX_TIMELINE_BUFS; i++) {
-            free_RawTimelineValuesBuf(&g_timeline_min[i]);
-            free_RawTimelineValuesBuf(&g_timeline_max[i]);
-            alloc_RawTimelineValuesBuf(&g_timeline_min[i], g_screen_w, 8, 16, 16, TR_SIMD_sint16x8);
-            alloc_RawTimelineValuesBuf(&g_timeline_max[i], g_screen_w, 8, 16, 16, TR_SIMD_sint16x8);
-            // prepare_AggregationMinMax now takes visible sample count (dynamic)
-            int agg_samples = g_screen_w;
-            prepare_AggregationMinMax(&g_timeline_bufs[i], &g_timeline_min[0], &g_timeline_max[0], agg_samples);
+            realloc_RawTimelineValuesBufs(&g_timeline_min[i], g_screen_w);
+            realloc_RawTimelineValuesBufs(&g_timeline_max[i], g_screen_w);
+            prepare_AggregationMinMax(&g_timeline_bufs[i], &g_timeline_min[0], &g_timeline_max[0], g_screen_w);
         }
-        g_signal_curves_view.middle_offset = g_screen_h / 2;
         g_signal_curves_view.height = g_screen_h - g_signal_curves_view.start_y - 50; // 50px for bottom margin
     }
     if (g_visible_channels_changed) {
@@ -659,6 +688,7 @@ void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255); // Set color for min/max lines
     draw_time_axis(renderer, timestamp);
     draw_curves(renderer);
+    draw_timeline_overview(renderer, &g_timeline_bufs[0], &g_timeline_min[0]);
 
     // --- Draw follow mode status overlay ---
     char follow_status[32];
@@ -668,6 +698,7 @@ void screen_update(Uint32 timestamp, SDL_Renderer* renderer) {
 
     SDL_RenderPresent(renderer);
 }
+
 void on_timer_tick(Uint32 timestamp, SDL_Renderer* renderer) {
     if (g_follow_mode || g_aggregation_changed) {
         g_aggregation_changed = false;
@@ -750,7 +781,7 @@ int main(int argc, char *argv[]) {
                 if (event.window.event == SDL_WINDOWEVENT_RESIZED) {
                     g_screen_w = event.window.data1;
                     g_screen_h = event.window.data2;
-                    g_screen_size_changed = 1;
+                    g_screen_size_changed = true;
                     screen_update(now, renderer);
                 }
             }
@@ -780,6 +811,7 @@ int main(int argc, char *argv[]) {
     pcap_close(g_pcap_handle);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    free_fonts(); 
     TTF_Quit();
     SDL_Quit();
     db_free();
